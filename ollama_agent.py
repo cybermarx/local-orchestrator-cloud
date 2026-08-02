@@ -282,7 +282,7 @@ SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
    契约是 subagent 之间对接的**唯一依据**,务必让 provides 与 depends_on 互相吻合(谁提供、谁消费要一致;尤其注意写流程的两端都要连上)。
 3. 逐个 delegate:每次只把**该模块的「子目标」+「契约」**(必提供的符号/签名、可依赖的符号/签名)传给 subagent。**绝不要把总目标写进 subagent 的提示**——subagent 只该看到自己的子目标与契约。
 4. 你亲自写 main.py:基于上面设计的契约,import 各模块、按约定名字/签名调用它们,串成完整流程。用 write_main 暂存(务必让 import 名与 provides 完全一致)。
-5. 调用 assemble 组装(会自动冒烟与修复);若任务有明显 happy-path,再调用 verify 跑一个集成断言,让系统把逻辑错误也自动修掉。
+5. 调用 assemble 组装(会自动冒烟与修复);若任务有明显 happy-path,再调用 verify 跑一个集成断言,让系统把逻辑错误也自动修掉。若 assemble/verify 报告「缺失模块 X」或「No module named X」,说明 X 从未被 delegate——你必须在下一轮用 delegate 创建 X 模块(给出子目标与契约),然后再次 assemble,直到不再有缺失模块。
 6. 简单聊天可直接回答,不必 delegate。
 
 规则:
@@ -643,9 +643,13 @@ def assemble(project_name: str) -> str:
         lines = [smoke.format_report(out_dir, written, ok, failures)]
         if not ok:
             lines.append(f"   ⚠ 冒烟发现 {len(failures)} 个失败点,启动自动修复闭环")
-            rlog, fixed = repair_loop(out_dir, lambda d: smoke.smoke_project(d))
+            rlog, fixed, missing = repair_loop(out_dir, lambda d: smoke.smoke_project(d))
             lines += rlog
-            lines.append("   " + ("✅ 修复后冒烟通过" if fixed else "⚠ 自动修复未完全解决,见上方失败点;可手动检查或重 delegate"))
+            if missing:
+                lines.append("   ⚠ 缺失模块: " + ", ".join(sorted(missing)) +
+                             " — 请用 delegate 创建这些模块后重新 assemble")
+            lines.append("   " + ("✅ 修复后冒烟通过" if fixed else
+                       "⚠ 自动修复未完全解决;缺失模块请用 delegate 补齐后重新 assemble,其余失败点见上方"))
         else:
             lines.append("   ✅ 组装 + 冒烟通过,可直接 python main.py 运行")
         return "\n".join(lines)
@@ -681,6 +685,20 @@ def _map_module_to_subtask(module_name):
         if mm == name or mm.endswith("/" + name) or mm == module_name:
             return st
     return None
+
+
+def _missing_module_of(failure, delivered):
+    """判断失败点是否为『缺失模块』:error 含 No module named 'X' 且 X 的顶层名不在已交付
+    模块(delivered)中、也不是 main。返回顶层模块名或 None。仅依据 No module named 信号,
+    避免把『变量未定义』(name 'X' is not defined)等误判为缺失模块。"""
+    err = failure.get("error") or ""
+    m = re.search(r"No module named ['\"]?([\w.]+)['\"]?", err)
+    if not m:
+        return None
+    top = m.group(1).split(".")[0]
+    if top in delivered or top == "main":
+        return None
+    return top
 
 
 def _check_import(out_dir):
@@ -784,18 +802,29 @@ def _modules_imported_by_test(test_code):
 def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
     """check_fn(out_dir) -> (ok, failures[{module?,error}])。
     逐轮:定位失败模块→云端修复→重链→再校验,直到通过或轮次耗尽。
+    返回 (log, ok, missing):missing 为自动闭环无法新建的「缺失模块」集合(从未被 delegate),
+    需交由编排器(35B)用 delegate 补齐后再 assemble。
     scope: 当无法从 traceback 定位时,回退修复这些模块(verify 用于指定测试 import 的模块)。"""
     log = []
     ok, fails = check_fn(out_dir)
     if ok:
-        return log, True
+        return log, True, set()
     # 模块名集合:以 SUBTASKS 中实际委托的模块为准(权威),避免把 verify 写入的 test_smoke.py 也算进来
     module_names = {os.path.basename(st.get("manifest", {}).get("module", ""))
                     for st in SUBTASKS if st.get("manifest", {}).get("module")}
+    delivered = {m[:-3] if m.endswith(".py") else m for m in module_names}
+    missing = set()
     for rnd in range(1, rounds + 1):
         log.append(f"   🔧 修复轮次 {rnd}/{rounds}: {len(fails)} 个失败点")
         targets = []
+        missing = set()
         for f in fails:
+            # 缺失模块(No module named 'X' 且 X 从未被 delegate):自动闭环无法新建,
+            # 不路由到任何已存在条目(含组合根 MAIN),收集后交由 35B 补 delegate。
+            miss = _missing_module_of(f, delivered)
+            if miss:
+                missing.add(miss)
+                continue
             # 组合根(main.py)入口失败:直接归属 MAIN 条目,由重写修复(不再静默失败)
             sym = f.get("symbol")
             owner = None
@@ -813,6 +842,9 @@ def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
                 st = _map_module_to_subtask(owner)
                 if st and st not in targets:
                     targets.append(st)
+        if missing:
+            log.append("     - ⚠ 缺失模块: " + ", ".join(sorted(missing)) +
+                       " — 从未被 delegate,自动闭环无法新建;请编排器用 delegate 创建后重新 assemble")
         if not targets and scope:
             # 集成测试(断言失败)的 traceback 往往不点名模块,改用测试 import 的模块范围
             for mod in scope:
@@ -820,7 +852,10 @@ def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
                 if st and st not in targets:
                     targets.append(st)
         if not targets:
-            log.append("     - 无法把失败映射到任何子任务,停止自动修复")
+            if missing:
+                log.append("     - 缺失模块需编排器补 delegate,自动修复暂停")
+            else:
+                log.append("     - 无法把失败映射到任何子任务,停止自动修复")
             break
         full_err = "\n".join(f.get("error", "") for f in fails)[:3000]
         for st in targets:
@@ -830,8 +865,8 @@ def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
         ok, fails = check_fn(out_dir)
         if ok:
             log.append(f"   ✅ 第 {rnd} 轮修复后校验通过")
-            return log, True
-    return log, ok
+            return log, True, missing
+    return log, ok, missing
 
 
 def verify(project_name: str, test_code: str) -> str:
@@ -853,8 +888,11 @@ def verify(project_name: str, test_code: str) -> str:
                 mod = st.get("manifest", {}).get("module", "")
                 if mod and (mod == m + ".py" or mod.endswith("/" + m + ".py")):
                     scope.add(mod)
-        rlog, fixed = repair_loop(out_dir, lambda d: _check_test(d, test_code), scope=scope)
+        rlog, fixed, missing = repair_loop(out_dir, lambda d: _check_test(d, test_code), scope=scope)
         lines += rlog
+        if missing:
+            lines.append("   ⚠ 缺失模块: " + ", ".join(sorted(missing)) +
+                         " — 请用 delegate 创建后重新 assemble")
         lines.append("   " + ("✅ 修复后集成校验通过" if fixed else "⚠ 自动修复未完全解决,见上方失败点"))
         return "\n".join(lines)
     except Exception as e:
