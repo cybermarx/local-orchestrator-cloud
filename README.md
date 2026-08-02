@@ -27,7 +27,7 @@
   **总目标从不进 subagent 提示**。每个 subagent 只见自己这块，互不串扰。
 - **契约优先**：编排器先设计模块契约（provides=必暴露符号；depends_on=**含读写两端**的依赖），
   再逐个 delegate。写依赖（如 `user_db:create_user`）必须写进 depends_on，否则 subagent 可能自创不落库实现。
-- **自动修复闭环**：`link` / `verify` 在冒烟或集成断言失败后，把报错回灌给对应云端 subagent 修复
+- **自动修复闭环**：`assemble` / `verify` 在冒烟或集成断言失败后，把报错回灌给对应云端 subagent 修复
   （原地更新侧边存储条目）→ 重新组装 → 再校验，直到通过或达到 `AGENT_REPAIR_ROUNDS`。
 - **编排器写组合根**：main.py（串起各模块的入口）由编排器亲自写（`write_main` 工具），
   必须严格按契约的名字/签名调用各模块符号——这是「去 linker」下唯一需要人/编排器保证接口一致的地方。
@@ -54,7 +54,7 @@ python ollama_agent.py "写一个带登录的博客系统"
 NVIDIA_API_KEY=nvapi-xxx python ollama_agent.py "写一个带登录的博客系统"
 ```
 
-编排器会：理解总目标 → 设计模块契约 → 逐个 delegate → write_main 写组合根 → link 组装并冒烟 →（可选）verify 集成校验。
+编排器会：理解总目标 → 设计模块契约 → 逐个 delegate → write_main 写组合根 → assemble 组装并冒烟 →（可选）verify 集成校验。
 
 ## 环境变量
 

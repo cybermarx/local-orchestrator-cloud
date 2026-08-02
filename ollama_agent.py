@@ -3,11 +3,11 @@
 """
 本地编排器 + 云端 subagent + 本地冒烟验证器(去 linker)
 直连 Ollama(本地35B)作总指挥,唯一能力是把子任务 delegate 给英伟达云端模型,
-最后 link 把所有子任务组装成项目。纯标准库 + 本地 smoke.py,零额外依赖。
+最后 assemble 把所有子任务组装成项目。纯标准库 + 本地 smoke.py,零额外依赖。
 
 设计要点(去 linker):Python 的 import 系统本身就是 linker——模块=文件=命名空间,
 同目录放好文件即连通,无需独立接线。本脚本只负责:① 编排器设计模块契约 + 写 main.py
-(组合根);② 把各模块交给云端 subagent 实现;③ link 时把所有文件落到同目录,用
+(组合根);② 把各模块交给云端 subagent 实现;③ assemble 时把所有文件落到同目录,用
 smoke.py 做「导入全部模块 + 真正调用 main 入口」的契约感知冒烟,失败按 manifest 回灌修复。
 
 架构三层:
@@ -160,7 +160,7 @@ BUDGET = int(NUM_CTX * 0.8)
 # 侧边存储 + 路由器(上下文外,不进 35B 历史)
 # ----------------------------------------------------------------------------
 SUBTASKS = []  # [{"id","manifest":{...},"model","latency"}]
-MAIN_CODE = ""  # 编排器写的主函数(组合根),由 write_main 工具暂存,link 时一并落盘
+MAIN_CODE = ""  # 编排器写的主函数(组合根),由 write_main 工具暂存,assemble 时一并落盘
 
 
 class Nvidia429(Exception):
@@ -229,9 +229,9 @@ SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
 
 你有这些工具:
 - delegate(task, tier?, name?, provides?, depends_on?): 把一个子任务的**子目标**派给云端 subagent 完成。返回简短指针——真实成果存入「侧边存储」,不占对话上下文。
-- write_main(project_name, main_code): 你(编排器,掌握总目标)亲自写**主函数 main.py(组合根)**。它 import 各模块、按你设计的契约调用它们,把整个项目串起来。main.py 必须严格按 provides/depends_on 约定的**名字与签名**调用各模块符号——这是「去 linker」设计下唯一需要你保证接口一致的地方(同目录放文件即可,import 会自行接线)。这里只暂存代码,落盘由 link 统一做。
-- link(project_name): 所有模块 delegate 完成、且你已 write_main 后调用。它把所有模块文件 + main.py 落到同一目录(无需接线,Python import 即 linker),然后做「导入全部模块 + 真正调用 main 入口」的契约感知冒烟;对冒烟失败(符号名/签名漂移、缺失模块、循环依赖)自动启动修复闭环,返回项目树。
-- verify(project_name, test_code): 【可选】link 后,用一个 Python 片段对生成的项目做**集成校验**(你掌握总目标,应写出能验证核心流程的断言,如 register 后 login 能拿到 token)。失败会自动回灌云端 subagent 修复并重新组装。
+- write_main(project_name, main_code): 你(编排器,掌握总目标)亲自写**主函数 main.py(组合根)**。它 import 各模块、按你设计的契约调用它们,把整个项目串起来。main.py 必须严格按 provides/depends_on 约定的**名字与签名**调用各模块符号——这是「去 linker」设计下唯一需要你保证接口一致的地方(同目录放文件即可,import 会自行接线)。这里只暂存代码,落盘由 assemble 统一做。
+- assemble(project_name): 所有模块 delegate 完成、且你已 write_main 后调用。它把所有模块文件 + main.py 落到同一目录(无需接线,Python import 即 linker),然后做「导入全部模块 + 真正调用 main 入口」的契约感知冒烟;对冒烟失败(符号名/签名漂移、缺失模块、循环依赖)自动启动修复闭环,返回项目树。
+- verify(project_name, test_code): 【可选】assemble 后,用一个 Python 片段对生成的项目做**集成校验**(你掌握总目标,应写出能验证核心流程的断言,如 register 后 login 能拿到 token)。失败会自动回灌云端 subagent 修复并重新组装。
 
 工作方式(契约优先,去 linker):
 1. 理解用户的**总目标**;
@@ -242,15 +242,15 @@ SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
    契约是 subagent 之间对接的**唯一依据**,务必让 provides 与 depends_on 互相吻合(谁提供、谁消费要一致;尤其注意写流程的两端都要连上)。
 3. 逐个 delegate:每次只把**该模块的「子目标」+「契约」**(必提供的符号/签名、可依赖的符号/签名)传给 subagent。**绝不要把总目标写进 subagent 的提示**——subagent 只该看到自己的子目标与契约。
 4. 你亲自写 main.py:基于上面设计的契约,import 各模块、按约定名字/签名调用它们,串成完整流程。用 write_main 暂存(务必让 import 名与 provides 完全一致)。
-5. 调用 link 组装(会自动冒烟与修复);若任务有明显 happy-path,再调用 verify 跑一个集成断言,让系统把逻辑错误也自动修掉。
+5. 调用 assemble 组装(会自动冒烟与修复);若任务有明显 happy-path,再调用 verify 跑一个集成断言,让系统把逻辑错误也自动修掉。
 6. 简单聊天可直接回答,不必 delegate。
 
 规则:
 - delegate 的 task 就是该模块的「子目标」,要自包含、清晰。
-- provides/depends_on 是你(编排器)预先设计好的契约;若省略,subagent 会自行声明,但你可能需要在 link 前核对一致性。**务必把写依赖也写进 depends_on**,否则 subagent 可能自创一个不落库的实现(如注册只用内存字典)。
+- provides/depends_on 是你(编排器)预先设计好的契约;若省略,subagent 会自行声明,但你可能需要在 assemble 前核对一致性。**务必把写依赖也写进 depends_on**,否则 subagent 可能自创一个不落库的实现(如注册只用内存字典)。
 - 若 delegate 返回错误,换种描述重试,或把任务拆更细再 delegate。
 - 你无法自己联网;需要实时信息时,云端模型会用其训练知识回答(可能非最新),请向用户说明。
-- 最终回答要简洁,引用 link/verify 返回的项目路径与校验结论。
+- 最终回答要简洁,引用 assemble/verify 返回的项目路径与校验结论。
 """
 
 SUBAGENT_SYS = """你是一个代码 subagent。你只负责完成分配给你的**单个子任务**,你**不知道、也不需要知道**整个项目的总目标。
@@ -303,11 +303,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "write_main",
-            "description": "编排器亲自写主函数 main.py(组合根):import 各模块、按契约调用它们串起整个项目。main.py 必须严格按 provides/depends_on 约定的名字与签名调用各模块符号。这里只把代码暂存到侧边存储,落盘由 link 统一做。",
+            "description": "编排器亲自写主函数 main.py(组合根):import 各模块、按契约调用它们串起整个项目。main.py 必须严格按 provides/depends_on 约定的名字与签名调用各模块符号。这里只把代码暂存到侧边存储,落盘由 assemble 统一做。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string", "description": "项目目录名(须与后续 link 一致)"},
+                    "project_name": {"type": "string", "description": "项目目录名(须与后续 assemble 一致)"},
                     "main_code": {"type": "string", "description": "完整的 main.py 源码字符串(须定义 def main(): 且 if __name__=='__main__': main())"},
                 },
                 "required": ["project_name", "main_code"],
@@ -317,7 +317,7 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "link",
+            "name": "assemble",
             "description": "把所有已完成的子任务(侧边存储中)与 write_main 暂存的 main.py 组装成一个项目:落到同一目录(Python import 即 linker,不做接线)、做语法校验,并自动做「导入全部模块 + 调用 main 入口」的契约感知冒烟——冒烟失败(符号名/签名漂移、缺失模块、循环依赖)会启动自动修复闭环(回灌云端 subagent 修复后重新组装)。用于「写一个大项目」类任务收尾。",
             "parameters": {
                 "type": "object",
@@ -332,11 +332,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "verify",
-            "description": "对已 link 的项目做集成校验:你(编排器,掌握总目标)写一个 Python 片段导入生成模块并对核心流程断言(如 register 后 login 能拿到 token)。校验失败会自动把报错回灌给对应云端 subagent 修复并重新组装,直到通过或达到最大轮次。",
+            "description": "对已 assemble 的项目做集成校验:你(编排器,掌握总目标)写一个 Python 片段导入生成模块并对核心流程断言(如 register 后 login 能拿到 token)。校验失败会自动把报错回灌给对应云端 subagent 修复并重新组装,直到通过或达到最大轮次。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "project_name": {"type": "string", "description": "项目目录名(须已 link)"},
+                    "project_name": {"type": "string", "description": "项目目录名(须已 assemble)"},
                     "test_code": {"type": "string", "description": "集成校验用的 Python 代码字符串(导入项目模块并做断言;项目目录已在 sys.path)"},
                 },
                 "required": ["project_name", "test_code"],
@@ -538,7 +538,7 @@ def delegate(task: str, tier: str = "flash", name: str = None,
 
 
 def write_main(project_name: str, main_code: str) -> str:
-    """编排器(掌握总目标)亲自写组合根 main.py,暂存到 MAIN_CODE,link 时一并落盘。"""
+    """编排器(掌握总目标)亲自写组合根 main.py,暂存到 MAIN_CODE,assemble 时一并落盘。"""
     global MAIN_CODE
     MAIN_CODE = main_code or ""
     if not MAIN_CODE.strip():
@@ -547,13 +547,13 @@ def write_main(project_name: str, main_code: str) -> str:
         return ("[write_main] 已暂存,但警告:main_code 未定义 def main(),"
                 "smoke 将报『main.py 未定义 main() 入口』。建议补上 def main(): 与"
                 " if __name__ == '__main__': main()。")
-    return ("[write_main] 已暂存 main.py(组合根)。调用 link 即可与所有子任务模块"
+    return ("[write_main] 已暂存 main.py(组合根)。调用 assemble 即可与所有子任务模块"
             "组装到同一目录并做契约感知冒烟。")
 
 
-def link(project_name: str) -> str:
+def assemble(project_name: str) -> str:
     if not SUBTASKS:
-        return "[link] 侧边存储中没有已完成子任务,请先 delegate 若干子任务(并 write_main 组合根)。"
+        return "[assemble] 侧边存储中没有已完成子任务,请先 delegate 若干子任务(并 write_main 组合根)。"
     out_dir = os.path.join(PROJECT_DIR, project_name or "project")
     try:
         written = smoke.assemble(out_dir, SUBTASKS, MAIN_CODE)
@@ -568,7 +568,7 @@ def link(project_name: str) -> str:
             lines.append("   ✅ 组装 + 冒烟通过,可直接 python main.py 运行")
         return "\n".join(lines)
     except Exception as e:
-        return f"[link 错误] {e}"
+        return f"[assemble 错误] {e}"
 
 
 # ----------------------------------------------------------------------------
@@ -716,10 +716,10 @@ def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
 
 def verify(project_name: str, test_code: str) -> str:
     if not SUBTASKS:
-        return "[verify] 侧边存储为空,请先 delegate 并 link。"
+        return "[verify] 侧边存储为空,请先 delegate 并 assemble。"
     out_dir = os.path.join(PROJECT_DIR, project_name or "project")
     if not os.path.isdir(out_dir):
-        return f"[verify] 项目目录不存在: {out_dir},请先 link。"
+        return f"[verify] 项目目录不存在: {out_dir},请先 assemble。"
     try:
         ok, fails = _check_test(out_dir, test_code)
         if ok:
@@ -744,7 +744,7 @@ def verify(project_name: str, test_code: str) -> str:
 DISPATCH = {
     "delegate": delegate,
     "write_main": write_main,
-    "link": link,
+    "assemble": assemble,
     "verify": verify,
 }
 
@@ -976,7 +976,7 @@ def main():
 
     print(f"🦙 本地编排器 | 模型={MODEL} | num_ctx={NUM_CTX} | Ollama={OLLAMA_URL}")
     print(f"   compact: mode={SUMMARY_MODE if USE_SUMMARY else 'off'} | thinking={'on' if ENABLE_THINKING else 'off'} | 预算={BUDGET} token")
-    print(f"   工具: delegate(云端subagent) + link(本地连接器) + verify(集成校验+自动修复) | NVIDIA档: flash={len(NVIDIA_FLASH)} pro={len(NVIDIA_PRO)}")
+    print(f"   工具: delegate(云端subagent) + assemble(组装+冒烟) + verify(集成校验+自动修复) | NVIDIA档: flash={len(NVIDIA_FLASH)} pro={len(NVIDIA_PRO)}")
     if not NVIDIA_API_KEY:
         print("   ⚠ 未检测到 NVIDIA_API_KEY —— delegate 将报错,请先 export NVIDIA_API_KEY=nvapi-... 或在 config 中配置")
     else:
@@ -1011,7 +1011,7 @@ def main():
         try:
             ans = run_agent(q, history=history)
         except KeyboardInterrupt:
-            print("\n   ⏹ 已取消当前任务(已完成的子任务仍保留在内存,可继续 link 或重新 delegate)")
+            print("\n   ⏹ 已取消当前任务(已完成的子任务仍保留在内存,可继续 assemble 或重新 delegate)")
             continue
         print(f"\n🤖 {ans}")
         print(f"   [路由器状态] {ROUTER.status_line()}")
