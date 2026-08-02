@@ -551,6 +551,13 @@ def sub_orchestrate(task: str, name: str, provides: list, depends_on: list,
         shutil.move(built, target)
     # 子编排器的内部 SUBTASKS 已在 _pop 时丢弃,这里扫描落盘目录重建内部模块清单以生成桥
     os.makedirs(target, exist_ok=True)  # 首轮被截断/没真正组装时 target 可能还不存在
+    built_mods = [f for f in os.listdir(target)
+                  if f.endswith(".py") and f != "__init__.py"]
+    if not built_mods:
+        # 空子系统必须硬失败:子编排器没产出任何模块(规划被截断/只调用未组装),
+        # 若照常登记薄契约节点,父 assemble 冒烟必失败并拖入数轮 5 分钟级修复。
+        return (f"[{name}] 子系统构建失败:子编排器未产出任何模块({target} 为空)。"
+                f"请不要登记薄契约,请重新 delegate_subsystem 或拆成普通 delegate 分别构建。")
     init_code = _build_subpkg_init_from_dir(target, provides)
     try:
         with open(os.path.join(target, "__init__.py"), "w", encoding="utf-8") as f:
@@ -1517,6 +1524,16 @@ def _check_contracts(subtasks, main_code):
             if sym and sym not in mod_symbols.get(mod, set()):
                 issues.append(f"模块 {mod} 声明提供 '{sym}' 但文件中未定义该符号"
                               f"(可能改名/孤儿文件/被同名影子模块遮蔽)")
+    # ⑥ 重复提供:同一符号被多个模块声明提供(重复/遗留模块,如 sys_ops.py 与 system_ops.py)
+    provider_of = {}
+    for mod, prov in provided.items():
+        for sym in prov:
+            if sym:
+                provider_of.setdefault(sym, []).append(mod)
+    for sym, mods in provider_of.items():
+        if len(mods) > 1:
+            issues.append(f"符号 '{sym}' 被多个模块重复提供: {', '.join(sorted(set(mods)))}"
+                          f"(疑似重复/遗留模块,建议合并或删除其一)")
     for st in subtasks:                      # ② + ③ depends_on 解析
         m = st.get("manifest", {}) or {}
         mod = m.get("module") or ""
@@ -1875,6 +1892,9 @@ def verify(project_name: str, test_code: str, name: str = None) -> str:
     if not os.path.isdir(out_dir):
         return f"[verify] 项目目录不存在: {out_dir},请先 assemble。"
     tag = f"[{name}] " if name else ""
+    if not os.path.isfile(os.path.join(out_dir, "main.py")):
+        return (f"{tag}[verify 未执行] 项目目录里还没有 main.py,请先 write_main 并 assemble"
+                f"后再校验,避免对缺失的组合根空跑修复闭环。")
     # 关键:先体检测试代码本身。语法不通 = 测试被截断,而非项目有问题——
     # 此时绝不能进入修复闭环去「修」一个其实没坏的项目。
     try:
@@ -2284,17 +2304,24 @@ def run_agent(query: str, history: list = None) -> str:
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
-FIX_COMMON_ERRORS_PROMPT = (
-    "对刚构建的这个项目做一轮『质量巡检与修复』,重点检查并修正常见错误:\n"
-    "1. 孤儿文件:落盘模块名与 main.py 的 import 是否一致(不一致则改 main 的 import 或补模块);\n"
-    "2. 影子模块:不要命名成与标准库/已装第三方库同名(如 requests.py),避免遮蔽真库自引用递归;\n"
-    "3. 契约错配:模块对外函数签名与 main.py 调用方式一致(参数顺序/返回值形状,字典是平铺还是嵌套);\n"
-    "4. 静默吞异常:except 里吞掉错误后返回假数据(如恒 0.0)的,改为抛错或打日志;\n"
-    "5. 未接线/死代码:已交付模块是否被 main.py 真正 import 并使用,重复代码清除;\n"
-    "6. 相对导入:扁平淡目录下 main.py 用绝对导入(from x import ...),不要 from .x import ...;\n"
-    "7. 校验:用 verify 写【真实断言】验证核心流程(禁止把失败测试改成恒真断言强行通过)。\n"
-    "修复后重新 assemble 并确保冒烟通过。"
-)
+def fix_common_errors_prompt(proj: str = "项目") -> str:
+    """--fix-project 的内置巡检修复提示词(带项目名,强化『先读后改』与『不另起炉灶』)。"""
+    return (
+        f"对已载入侧边存储的这批已有模块({proj})做一轮『质量巡检与修复』,重点检查并修正常见错误:\n"
+        "0. 【先读后改】逐个读取已载入的每个模块的完整代码,先理解再审查;修复必须基于这些真实代码,"
+        "不要凭空新建无关的子系统/模块,不要改变对外符号名;\n"
+        "1. 孤儿文件:落盘模块名与 main.py 的 import 是否一致(不一致则改 main 的 import 或补模块);\n"
+        "2. 影子模块:不要命名成与标准库/已装第三方库同名(如 requests.py),避免遮蔽真库自引用递归;\n"
+        "3. 重复模块:同一符号被多个模块重复提供(如 sys_ops.py 与 system_ops.py 都提供 hide_window)时,"
+        "合并或删除其一;\n"
+        "4. 契约错配:模块对外函数签名与 main.py 调用方式一致(参数顺序/返回值形状,字典是平铺还是嵌套);\n"
+        "5. 静默吞异常:except 里吞掉错误后返回假数据(如恒 0.0)的,改为抛错或打日志;\n"
+        "6. 未接线/死代码:已交付模块是否被 main.py 真正 import 并使用,重复代码清除;\n"
+        "7. 相对导入:扁平淡目录下 main.py 用绝对导入(from x import ...),不要 from .x import ...;\n"
+        "8. 校验:用 verify 写【真实断言】验证核心流程(禁止把失败测试改成恒真断言强行通过)。\n"
+        f"组装时 write_main/assemble 的 project_name 请沿用 {proj} 或其派生名(如 {proj}_fixed),"
+        "不要另起炉灶。修复后重新 assemble 并确保冒烟通过。"
+    )
 
 _MANUAL = """\
 使用示例:
@@ -2308,9 +2335,9 @@ _MANUAL = """\
   构建完成后,把项目目录传给 --fix-project(等价于 --improve 目录 + 内置"检查并修复常见错误"提示词),
   再带上 --local,让同一个 35B 对成品做一轮质量巡检与修复;也可用 query 自定义本次巡检要求。
 
-内置巡检项(FIX_COMMON_ERRORS_PROMPT):
-  孤儿文件 / 影子模块(遮蔽标准库与第三方库) / 契约错配(签名与返回形状) / 静默吞异常返回假数据 /
-  未接线死代码 / 相对导入 / verify 真实断言防作弊。
+内置巡检项(fix_common_errors_prompt):
+  先读后改 / 孤儿文件 / 影子模块(遮蔽标准库与第三方库) / 重复模块 / 契约错配(签名与返回形状) /
+  静默吞异常返回假数据 / 未接线死代码 / 相对导入 / verify 真实断言防作弊。
 
 环境变量(可选):
   AGENT_NUM_CTX 编排器上下文窗口(默认8192)  AGENT_SUB_CTX_MAX 放大上限(默认24576,8GB显存勿再调大)
@@ -2343,7 +2370,8 @@ def main():
         if not args.improve:
             args.improve = args.fix_project
         if not args.query:
-            args.query = [FIX_COMMON_ERRORS_PROMPT]
+            _proj = os.path.basename(os.path.abspath(args.improve).rstrip(os.sep)) or "项目"
+            args.query = [fix_common_errors_prompt(_proj)]
 
     # --improve:把已有代码载入侧边存储,并把「在此基础改进」的指引前置到任务里
     if args.improve:
