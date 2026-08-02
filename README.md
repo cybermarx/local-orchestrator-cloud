@@ -1,8 +1,8 @@
 # local-orchestrator-cloud
 
-本地 Ollama 35B 编排器 + 云端 NVIDIA subagent + 本地 linker 的「契约优先 / 盲 subagent」agent。
+本地 Ollama 35B 编排器 + 云端 NVIDIA subagent + 本地冒烟验证器（去 linker）的「契约优先 / 盲 subagent」agent。
 
-> 这是 **云端 subagent 版本** 的快照备份。核心思路：本地 35B 只做规划与调度（对话历史只存「指针」，不存大段代码），每个子任务派给云端模型无状态地独立生成，最后由本地确定性连接器组装、校验、并自动修复。
+> 这是 **云端 subagent 版本** 的快照。核心思路：本地 35B 只做规划与调度（对话历史只存「指针」，不存大段代码），每个子任务派给云端模型无状态地独立生成，最后由本地确定性验证器组装、校验、并自动修复。**「去 linker」设计**：Python 的 import 系统本身就是连接器（模块=文件=命名空间，同目录放好即连通），因此删除了接线逻辑，只保留「同目录落盘 + 契约感知冒烟 + 按符号归属回灌修复」。
 
 ## 架构（三层）
 
@@ -15,9 +15,10 @@
    把子目标 + 契约 作为一次性 /api/chat 请求发出，拿回 {module, code, provides, depends_on}。
    每个 subagent 不知道总目标（信息隔离），1M ctx。
 
-③ 本地 linker.py
-   确定性「动态连接器」：解析依赖图、落盘、生成 requirements/main 脚手架、
-   语法校验、导入冒烟。零 token、纯标准库。
+③ 本地 smoke.py（去 linker）
+   确定性「冒烟验证器」：把所有模块文件 + 编排器写的 main.py 落到同一目录
+   （Python import 即 linker，不做接线），然后导入全部模块 + 调用 main 入口做契约感知冒烟，
+   失败按 module.symbol 归属回灌修复。零 token、纯标准库。
 ```
 
 ## 关键设计
@@ -26,15 +27,17 @@
   **总目标从不进 subagent 提示**。每个 subagent 只见自己这块，互不串扰。
 - **契约优先**：编排器先设计模块契约（provides=必暴露符号；depends_on=**含读写两端**的依赖），
   再逐个 delegate。写依赖（如 `user_db:create_user`）必须写进 depends_on，否则 subagent 可能自创不落库实现。
-- **自动修复闭环**：`link` / `verify` 在导入冒烟或集成断言失败后，把报错回灌给对应云端 subagent 修复
-  （原地更新侧边存储条目）→ 重链 → 再校验，直到通过或达到 `AGENT_REPAIR_ROUNDS`。
+- **自动修复闭环**：`link` / `verify` 在冒烟或集成断言失败后，把报错回灌给对应云端 subagent 修复
+  （原地更新侧边存储条目）→ 重新组装 → 再校验，直到通过或达到 `AGENT_REPAIR_ROUNDS`。
+- **编排器写组合根**：main.py（串起各模块的入口）由编排器亲自写（`write_main` 工具），
+  必须严格按契约的名字/签名调用各模块符号——这是「去 linker」下唯一需要人/编排器保证接口一致的地方。
 
 ## 文件
 
 | 文件 | 说明 |
 |---|---|
 | `ollama_agent.py` | 核心：本地 35B 编排器 + 云端 subagent 调度 + 自动修复闭环 |
-| `linker.py` | 本地确定性连接器：依赖解析/落盘/语法校验/导入冒烟 |
+| `smoke.py` | 本地冒烟验证器：同目录落盘/导入全部模块+调用 main 入口/契约感知校验 |
 | `nvidia-claude-proxy.js` | 云端路由代理（NVIDIA↔OpenAI 翻译、503/429 降级，被本 agent 复用的工具链一部分） |
 | `CLAUDE.md` | 项目说明与约定 |
 
@@ -51,7 +54,7 @@ python ollama_agent.py "写一个带登录的博客系统"
 NVIDIA_API_KEY=nvapi-xxx python ollama_agent.py "写一个带登录的博客系统"
 ```
 
-编排器会：理解总目标 → 设计模块契约 → 逐个 delegate → link 组装 →（可选）verify 集成校验。
+编排器会：理解总目标 → 设计模块契约 → 逐个 delegate → write_main 写组合根 → link 组装并冒烟 →（可选）verify 集成校验。
 
 ## 环境变量
 
