@@ -66,7 +66,7 @@ import smoke
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 MODEL = os.environ.get("AGENT_MODEL", "fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:IQ2_M")
 NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "8192"))
-MAX_ITER = int(os.environ.get("AGENT_MAX_ITER", "12"))
+MAX_ITER = int(os.environ.get("AGENT_MAX_ITER", "30"))
 TEMPERATURE = float(os.environ.get("AGENT_TEMP", "0.7"))
 
 # ----------------------------------------------------------------------------
