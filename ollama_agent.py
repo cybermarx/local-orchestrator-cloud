@@ -108,8 +108,16 @@ SPLIT_MAX_SUBTASKS = int(os.environ.get("AGENT_SPLIT_MAX", "4"))   # 拆分最�
 # 否则思考撑爆窗口→content 为空(上一轮修过的 bug)。开关逐调用即时生效、调用完即
 # 失效(每次请求无状态传 think),不存在"忘了关"的残留。
 THINK_ON_SPLIT = os.environ.get("AGENT_THINK_ON_SPLIT", "1").lower() in ("1", "true", "yes", "on")
+# THINK_ON_REPAIR:非两阶段(云端/回退)时,单次修复调用是否开思考(默认关:修复输出含整段代码,长输出+思考有撑爆窗口风险)。
 THINK_ON_REPAIR = os.environ.get("AGENT_THINK_ON_REPAIR", "0").lower() in ("1", "true", "yes", "on")
 THINK_NUM_CTX = int(os.environ.get("AGENT_THINK_NUM_CTX", "16384"))  # 思考步骤的 num_ctx 下限
+
+# --- 两阶段 repair(诊断→修复):把"需推理的短诊断"与"不需推理的长修复"拆开 ------
+# 修复本质是"诊断(为什么错、怎么改)+ 改代码"两种性质相反的工作。捆一次调用 → 想开思考
+# 诊断却被长代码撑爆窗口。拆成:①诊断(开思考·短输出,实测175字符/34s/更准) ②修复(关思考·
+# 长输出)。诊断若判定 needs_rewrite(模块烂到要重写)且深度未满 → 递归拆子模块重写(契约不破)。
+TWO_STAGE_REPAIR = os.environ.get("AGENT_TWO_STAGE_REPAIR", "1").lower() in ("1", "true", "yes", "on")
+THINK_ON_REPAIR_DIAG = os.environ.get("AGENT_THINK_ON_REPAIR_DIAG", "1").lower() in ("1", "true", "yes", "on")
 
 # ----------------------------------------------------------------------------
 # NVIDIA 凭证加载(优先 env,否则回退读取常见 Claude/WorkBuddy config)
@@ -415,6 +423,22 @@ SUBAGENT_SPLIT_SYS = """你是一个任务拆分器。你刚收到的这个子�
 - 只输出 JSON。
 """
 
+SUBAGENT_DIAG_SYS = """你是一个代码诊断专家。下面给你一个有缺陷的 Python 模块和它的报错信息。
+你现在的工作**不是修代码**,而是精准诊断:错在哪、为什么错、该怎么改。
+请只输出一个 JSON 对象(不要解释文字、不要用 markdown 代码块包裹):
+{
+  "cause": "一句话说清根本病因",
+  "plan": ["具体修改步骤1", "具体修改步骤2"],
+  "needs_rewrite": false
+}
+要求:
+- 只诊断,**绝不输出修正后的完整代码**(诊断很短,不会被截断)。
+- plan 要具体到能让另一个人照着改对,不要泛泛而谈。
+- needs_rewrite: 仅需局部小修=false;若模块逻辑大面积错误、或修好后明显超过 %MAXMOD% 行=true。
+- 保持模块原有职责与 provides 接口不变的前提下诊断。
+- 只输出 JSON。
+"""
+
 # 粒度上限注入 prompt(prompt 含字面花括号,不能用 f-string,故用占位符替换)
 for _ph, _v in (("%MAXMOD%", MAX_MODULE_LINES), ("%MAXMAIN%", MAX_MAIN_LINES),
                 ("%MAXTEST%", MAX_TEST_LINES),
@@ -422,6 +446,7 @@ for _ph, _v in (("%MAXMOD%", MAX_MODULE_LINES), ("%MAXMAIN%", MAX_MAIN_LINES),
     SYSTEM_PROMPT = SYSTEM_PROMPT.replace(_ph, str(_v))
     SUBAGENT_SYS = SUBAGENT_SYS.replace(_ph, str(_v))
     SUBAGENT_SPLIT_SYS = SUBAGENT_SPLIT_SYS.replace(_ph, str(_v))
+    SUBAGENT_DIAG_SYS = SUBAGENT_DIAG_SYS.replace(_ph, str(_v))
 
 
 # ----------------------------------------------------------------------------
@@ -660,6 +685,14 @@ def subagent_repair_messages(repair, contract=None):
         f"[当前代码]\n```python\n{repair.get('current_code', '')}\n```",
         f"[报错 / 校验失败信息]\n{repair.get('error', '')}",
     ]
+    # 两阶段修复:阶段①诊断已给出病因与方案,这里注入,让本阶段"照方案改"而非重新推理
+    diag = repair.get("_diag")
+    if diag:
+        if diag.get("cause"):
+            parts.append(f"[已诊断病因]\n{diag['cause']}")
+        if diag.get("plan"):
+            parts.append("[修改方案(严格照此逐条修改)]\n" +
+                         "\n".join(f"- {p}" for p in diag["plan"]))
     if contract:
         provides = contract.get("provides") or []
         depends_on = contract.get("depends_on") or []
@@ -701,6 +734,25 @@ def subagent_split_messages(task, contract=None, prev_manifest=None):
     ]
 
 
+def subagent_diag_messages(repair, contract=None):
+    """两阶段修复的阶段①诊断:只让 subagent 输出短的病因+方案(不输出代码),
+    因此可安全开思考——思考链 + 短诊断都装得进窗口。"""
+    parts = [
+        f"[原始子目标]\n{repair.get('original_task', '')}",
+        f"[当前代码]\n```python\n{repair.get('current_code', '')}\n```",
+        f"[报错 / 校验失败信息]\n{repair.get('error', '')}",
+    ]
+    if contract:
+        provides = contract.get("provides") or []
+        if provides:
+            parts.append("[必须保持的接口 provides(诊断时须保证方案不改这些签名)]\n" +
+                         "\n".join(f"- {p}" for p in provides))
+    return [
+        {"role": "system", "content": SUBAGENT_DIAG_SYS},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+
+
 def parse_split_output(text):
     """解析拆分计划,返回 [{name,task,provides,depends_on}, ...](解析失败或无子任务返回 [])。"""
     if not text:
@@ -736,6 +788,36 @@ def parse_split_output(text):
             "depends_on": s.get("depends_on") or [],
         })
     return out
+
+
+def parse_diag_output(text):
+    """解析诊断输出,返回 {cause, plan, needs_rewrite} 或 None(解析失败→回退单阶段修复)。"""
+    if not text:
+        return None
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+        t = re.sub(r"\n?```$", "", t).strip()
+    obj = None
+    try:
+        obj = json.loads(t)
+    except Exception:
+        m = re.search(r"\{.*\}", t, re.S)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+            except Exception:
+                obj = None
+    if not isinstance(obj, dict):
+        return None
+    cause = (obj.get("cause") or "").strip()
+    plan = obj.get("plan") or []
+    if isinstance(plan, str):
+        plan = [plan]
+    plan = [str(p).strip() for p in plan if str(p).strip()]
+    if not cause and not plan:
+        return None
+    return {"cause": cause, "plan": plan, "needs_rewrite": bool(obj.get("needs_rewrite"))}
 
 
 def _wait_printer(stop, model, label, interval=20):
@@ -787,15 +869,16 @@ def _too_big(manifest):
     return False
 
 
-def _subagent_once(router, chat_fn, tier, tmo, msgs, label, think=False):
-    """发起一次 subagent 调用(带等待提示),返回 content。用于拆分决策等辅助调用(不做 failover)。
-    think=True 仅对本地 ollama 后端开思考(云端后端思考由服务端控制,忽略此参数)。"""
+def _subagent_once(router, chat_fn, tier, tmo, msgs, label, think=False, verb="拆分"):
+    """发起一次 subagent 调用(带等待提示),返回 content。用于拆分/诊断等辅助调用(不做 failover)。
+    think=True 仅对本地 ollama 后端开思考(云端后端思考由服务端控制,忽略此参数)。
+    verb 只影响打印文案(如"拆分"/"诊断")。"""
     model = router.select(tier)
     stop = threading.Event()
     wp = threading.Thread(target=_wait_printer, args=(stop, model, label), daemon=True)
     t0 = time.perf_counter()
     try:
-        print(f"   ⌛ 调用 {model} 拆分'{label}'…", flush=True)
+        print(f"   ⌛ 调用 {model} {verb}'{label}'…", flush=True)
         wp.start()
         extra = {"think": True} if (think and chat_fn is ollama_subagent_chat) else {}
         content = chat_fn(model, msgs, timeout=tmo, **extra)
@@ -805,8 +888,30 @@ def _subagent_once(router, chat_fn, tier, tmo, msgs, label, think=False):
         stop.set(); wp.join(timeout=1)
 
 
+def _diagnose(repair, contract, router, chat_fn, tier, tmo, label):
+    """两阶段修复的阶段①:开思考做诊断,只输出短方案 {cause, plan, needs_rewrite}。
+    成功返回 dict;失败(调用异常/无法解析)返回 None,由调用方回退单阶段修复。
+    诊断输出极短(实测 120~175 字符),思考链装得进窗口,不会触发"空内容"截断。"""
+    try:
+        content = _subagent_once(
+            router, chat_fn, tier, tmo,
+            subagent_diag_messages(repair, contract), f"{label}:diag",
+            think=THINK_ON_REPAIR_DIAG, verb="诊断")  # 诊断=推理步骤,输出短,安全开思考
+    except Exception as e:
+        print(f"   ⚠ 诊断调用失败({type(e).__name__}),回退单阶段修复", flush=True)
+        return None
+    diag = parse_diag_output(content)
+    if not diag:
+        print("   ⚠ 诊断输出无法解析,回退单阶段修复", flush=True)
+        return None
+    rw = "需重写" if diag.get("needs_rewrite") else "局部小修"
+    print(f"   🔎 诊断: {diag.get('cause', '')[:60]} | {rw} | {len(diag.get('plan', []))} 步方案",
+          flush=True)
+    return diag
+
+
 def _split_and_recurse(task, name, contract, prev_manifest, tier, depth,
-                       router, chat_fn, tmo):
+                       router, chat_fn, tmo, replace_id=None):
     """任务过大→让同一 subagent 拆成子任务→逐个递归 delegate→(有 provides 则)生成聚合模块。
     返回给编排器看的字符串;拆分未成功则返回 None,由调用方落回"直接使用原代码"。"""
     parent = (name or task[:12]).strip() or "part"
@@ -854,7 +959,8 @@ def _split_and_recurse(task, name, contract, prev_manifest, tier, depth,
             f"[原任务]\n{task}")
         delegate(agg_task, tier=tier, name=parent,
                  provides=parent_provides, depends_on=child_provides,
-                 _depth=MAX_DELEGATE_DEPTH)   # 深度到顶:强制出代码,聚合不再拆
+                 _depth=MAX_DELEGATE_DEPTH,   # 深度到顶:强制出代码,聚合不再拆
+                 replace_id=replace_id)       # repair 重写:聚合顶替原失败条目(保契约映射)
         agg_note = f" + 聚合模块 {parent}"
 
     tag = f"[{name}] " if name else ""
@@ -886,6 +992,25 @@ def delegate(task: str, tier: str = "flash", name: str = None,
         contract = {"provides": provides or [], "depends_on": depends_on or []}
     tried = set()  # 本轮回避:同一模型本轮不再重试
     label = name or task[:14]
+    # 两阶段修复(仅本地 ollama):先诊断(开思考·短输出),再据诊断决定"递归重写"还是"局部小修"。
+    # 化解"想开思考但长输出会撑爆窗口"的假两难——诊断与修复本是两种相反性质的工作,拆开就没了。
+    if repair and TWO_STAGE_REPAIR and chat_fn is ollama_subagent_chat:
+        diag = _diagnose(repair, contract, router, chat_fn, tier, tmo, label)
+        if diag:
+            # 大改/重写 且 原地修复(replace_id) 且深度未满 → 把该模块当成一次全新 delegate,
+            # 递归拆子模块 + 短聚合模块顶替原条目(保持 module/provides 契约映射不破)。
+            if (diag.get("needs_rewrite") and replace_id is not None
+                    and _depth < MAX_DELEGATE_DEPTH):
+                rewritten = _split_and_recurse(
+                    repair.get("original_task", task), name, contract,
+                    {"code": repair.get("current_code", ""), "truncated": False},
+                    tier, _depth, router, chat_fn, tmo, replace_id=replace_id)
+                if rewritten is not None:
+                    tag = f"[{name}] " if name else ""
+                    return f"{tag}子任务#{replace_id} 诊断判定需重写 → {rewritten}"
+            # 局部小修:把诊断方案并入 repair,循环内修复阶段关思考、照方案改
+            repair = dict(repair)
+            repair["_diag"] = diag
     for _ in range(tries):
         model = router.select(tier, exclude=tried)
         t0 = time.perf_counter()
@@ -895,10 +1020,15 @@ def delegate(task: str, tier: str = "flash", name: str = None,
             print(f"   ⌛ 调用 {model} 生成子任务'{label}'…", flush=True)
             wp.start()
             msgs = subagent_repair_messages(repair, contract) if repair else subagent_messages(task, contract)
-            # 修复=诊断步骤,可选开思考(默认关:修复输出含整段代码,长输出+思考有撑爆窗口风险);
-            # 写新模块=纯长输出,恒关思考。
-            extra = ({"think": True}
-                     if (repair and THINK_ON_REPAIR and chat_fn is ollama_subagent_chat) else {})
+            # 修复阶段思考策略:
+            #  - 两阶段(repair 带 _diag):诊断已在阶段①开思考做完,本阶段"照方案吐长代码",关思考;
+            #  - 单阶段回退(无 _diag):按 THINK_ON_REPAIR(默认关,长输出+思考有撑爆窗口风险);
+            #  - 写新模块:纯长输出,恒关思考。
+            if repair and chat_fn is ollama_subagent_chat:
+                want_think = False if repair.get("_diag") else THINK_ON_REPAIR
+            else:
+                want_think = False
+            extra = {"think": True} if want_think else {}
             content = chat_fn(model, msgs, timeout=tmo, **extra)
             latency = time.perf_counter() - t0
             stop.set(); wp.join(timeout=1)
@@ -1634,9 +1764,11 @@ def main():
 
     print(f"🦙 本地编排器 | 模型={MODEL} | num_ctx={NUM_CTX} | Ollama={OLLAMA_URL}")
     print(f"   compact: mode={SUMMARY_MODE if USE_SUMMARY else 'off'} | thinking={'on' if ENABLE_THINKING else 'off'} | 预算={BUDGET} token")
+    _repair_desc = (f"两阶段(诊断={'on' if THINK_ON_REPAIR_DIAG else 'off'}/修复=off)"
+                    if TWO_STAGE_REPAIR else f"单阶段={'on' if THINK_ON_REPAIR else 'off'}")
     print(f"   选择性推理: 顶层规划={'on' if ENABLE_THINKING else 'off'}"
           f" · 拆分决策={'on' if THINK_ON_SPLIT else 'off'}"
-          f" · 修复诊断={'on' if THINK_ON_REPAIR else 'off'}"
+          f" · 修复诊断={_repair_desc}"
           f" · 写代码=off(恒关) | 思考步骤 num_ctx≥{THINK_NUM_CTX}")
     print(f"   输出预算: 编排器≤{ORCH_MAX_PREDICT} / subagent≤{SUB_NUM_PREDICT} token"
           f" | 截断自动续写×{MAX_CONTINUE}"
