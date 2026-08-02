@@ -695,6 +695,30 @@ def _seed_existing_code(path: str) -> int:
     return count
 
 
+def _subtask_inventory() -> str:
+    """把 SUBTASKS 里已载入/已交付的普通模块渲染成『模块名 → 提供符号』清单,注入编排器上下文。
+    35B 若看不到真实符号名会臆造(如把 mining.py 记成 miner.py、把 hide_window 记成 get_sys_info),
+    进而写错 import、把 verify/修复闭环拖入数轮空转。清单只占几十 token,物超所值。"""
+    lines = []
+    provider_of = {}
+    for st in SUBTASKS:
+        m = st.get("manifest", {}) or {}
+        mod = m.get("module") or ""
+        if mod == "main.py" or st.get("is_subsystem"):
+            continue
+        prov = [p for p in (m.get("provides") or []) if p]
+        lines.append(f"- {mod} 提供: {', '.join(prov) if prov else '(无对外提供)'}")
+        for p in prov:
+            sym = p.split("(")[0].split("->")[0].strip()
+            if sym:
+                provider_of.setdefault(sym, []).append(mod)
+    dup = sorted({s for s, ms in provider_of.items() if len(set(ms)) > 1})
+    if dup:
+        lines.append("  ⚠ 重复提供: " + ", ".join(dup) +
+                     " 由多个模块提供,请合并或删除其一")
+    return "\n".join(lines) if lines else "(空)"
+
+
 # ----------------------------------------------------------------------------
 # 工具 schema(精简,控制总 token 数)
 # ----------------------------------------------------------------------------
@@ -703,7 +727,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "delegate",
-            "description": "把一个子任务派给英伟达云端模型(subagent)完成。用于需要生成代码/内容/计算的子任务。返回简短指针(真实成果存入侧边存储,不占上下文)。复杂任务请先自行分解为多个子任务,逐个 delegate。",
+            "description": "把一个子任务派给云端模型(subagent)完成。用于需要生成代码/内容/计算的子任务。返回简短指针(真实成果存入侧边存储,不占上下文)。复杂任务请先自行分解为多个子任务,逐个 delegate。注意:subagent 无法读取你的项目文件,产出是【新代码模块】而非报告——不要委派『读取/查看/打印文件』类任务;要审查已有代码,直接基于你掌握的真实符号清单 delegate 目标模块即可。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2377,8 +2401,14 @@ def main():
     if args.improve:
         n = _seed_existing_code(args.improve)
         if n:
+            inv = _subtask_inventory()
             note = (f"[已有代码已载入侧边存储,共 {n} 个模块。请在保留这些模块核心职责与"
-                    f"对外接口的前提下做如下改进: ")
+                    f"对外接口的前提下做如下改进。\n"
+                    f"[已载入模块清单——只准引用下列【真实】模块名与提供符号,不要臆造不存在的名字"
+                    f"(如把 mining.py 记成 miner.py)]\n{inv}\n"
+                    f"注意:不要 delegate『读取/查看/打印文件』类任务——subagent 产出的是新代码模块,"
+                    f"不会把文件内容读回给你;要审查/修复代码,直接基于上面清单 delegate 目标模块。\n"
+                    f"改进任务: ")
             args.query = [note] + list(args.query)
             print(f"   📥 已载入已有代码 {n} 个模块,将在此基础上改进(项目名={_CURRENT_PROJECT})")
 
