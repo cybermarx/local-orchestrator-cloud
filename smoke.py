@@ -68,10 +68,20 @@ def assemble(out_dir, subtasks, main_code):
 
 
 def _symbol_from_error(text):
-    """从错误文本尽量提取 'module.symbol' 形式的问题符号,用于精确路由修复。"""
+    """从错误文本尽量提取 'module.symbol' 形式的问题符号,用于精确路由修复。
+    覆盖:符号缺失(AttributeError)、未定义名字、签名不匹配、
+    未交付模块(No module named 'X')、无法从模块导入某符号(cannot import name 'Y' from 'Z')。"""
     m = re.search(r"module '([\w\.]+)' has no attribute '([\w]+)'", text or "")
     if m:
         return f"{m.group(1)}.{m.group(2)}"
+    # 未交付/拼错的模块:No module named 'X' -> 返回 X(裸名,供路由或报告)
+    m = re.search(r"No module named '([\w\.]+)'", text or "")
+    if m:
+        return m.group(1)
+    # 无法从模块导入某符号:cannot import name 'Y' from 'Z' -> 返回 Z.Y
+    m = re.search(r"cannot import name '([\w]+)' from '([\w\.]+)'", text or "")
+    if m:
+        return f"{m.group(2)}.{m.group(1)}"
     m = re.search(r"name '([\w]+)' is not defined", text or "")
     if m:
         return m.group(1)

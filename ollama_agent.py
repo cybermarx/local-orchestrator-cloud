@@ -194,6 +194,8 @@ BUDGET = int(NUM_CTX * 0.8)
 # ----------------------------------------------------------------------------
 SUBTASKS = []  # [{"id","manifest":{...},"model","latency"}]
 MAIN_CODE = ""  # 编排器写的主函数(组合根),由 write_main 工具暂存,assemble 时一并落盘
+MAIN_SUBTASK_ID = "__MAIN__"  # 组合根 main.py 在 SUBTASKS 中的特殊条目 id(可修复路由用)
+
 
 
 class Nvidia429(Exception):
@@ -588,26 +590,55 @@ def delegate(task: str, tier: str = "flash", name: str = None,
     return f"[delegate 失败] 所有候选模型均不可用({last_err})。可换种描述重试,或拆分更细的子任务。"
 
 
+def _get_main_code():
+    """组合根 main.py 的当前代码:优先取 SUBTASKS 中 MAIN 条目(assemble/repair 后会更新),
+    否则回退到 MAIN_CODE 全局。保证修复闭环重写 main.py 后 assemble 用最新版本。"""
+    for st in SUBTASKS:
+        if st.get("id") == MAIN_SUBTASK_ID:
+            return st.get("manifest", {}).get("code", "") or ""
+    return MAIN_CODE
+
+
 def write_main(project_name: str, main_code: str) -> str:
-    """编排器(掌握总目标)亲自写组合根 main.py,暂存到 MAIN_CODE,assemble 时一并落盘。"""
+    """编排器(掌握总目标)亲自写组合根 main.py,注册为 SUBTASKS 中的 MAIN 条目(可修复路由),
+    assemble 时一并落盘。"""
     global MAIN_CODE
     MAIN_CODE = main_code or ""
     if not MAIN_CODE.strip():
         return "[write_main] 收到空代码,未暂存。请传入完整的 main.py 源码。"
+    # 注册/更新 MAIN 条目(供自动修复闭环路由:组合根 import 错误可被重写)
+    for st in SUBTASKS:
+        if st.get("id") == MAIN_SUBTASK_ID:
+            st["manifest"] = {"module": "main.py", "code": MAIN_CODE}
+            st["task"] = "组合根 main.py（导入各业务模块、串起整个项目流程）"
+            break
+    else:
+        SUBTASKS.append({
+            "id": MAIN_SUBTASK_ID,
+            "task": "组合根 main.py（导入各业务模块、串起整个项目流程）",
+            "manifest": {"module": "main.py", "code": MAIN_CODE},
+            "contract": None,
+            "model": None,
+            "tier": "pro",
+            "latency": None,
+        })
     if "def main(" not in MAIN_CODE:
         return ("[write_main] 已暂存,但警告:main_code 未定义 def main(),"
                 "smoke 将报『main.py 未定义 main() 入口』。建议补上 def main(): 与"
                 " if __name__ == '__main__': main()。")
-    return ("[write_main] 已暂存 main.py(组合根)。调用 assemble 即可与所有子任务模块"
-            "组装到同一目录并做契约感知冒烟。")
+    return ("[write_main] 已暂存 main.py(组合根)并注册为可修复条目。调用 assemble 即可与所有"
+            "子任务模块组装到同一目录并做契约感知冒烟；组装失败时组合根可被自动重写修复。")
 
 
 def assemble(project_name: str) -> str:
-    if not SUBTASKS:
-        return "[assemble] 侧边存储中没有已完成子任务,请先 delegate 若干子任务(并 write_main 组合根)。"
+    biz_subtasks = [st for st in SUBTASKS if st.get("manifest", {}).get("module") != "main.py"]
+    if not biz_subtasks:
+        return "[assemble] 侧边存储中没有业务子任务,请先 delegate 若干子任务(并 write_main 组合根)。"
     out_dir = os.path.join(PROJECT_DIR, project_name or "project")
     try:
-        written = smoke.assemble(out_dir, SUBTASKS, MAIN_CODE)
+        # main.py 由 _get_main_code 单独落盘;业务模块排除 main.py 条目,避免双重写
+        main_code = _get_main_code()
+        written = smoke.assemble(out_dir, biz_subtasks, main_code)
         ok, failures = smoke.smoke_project(out_dir)
         lines = [smoke.format_report(out_dir, written, ok, failures)]
         if not ok:
@@ -678,9 +709,44 @@ def _check_test(out_dir, test_code):
         return False, [{"module": None, "error": f"{type(e).__name__}: {e}"}]
 
 
+def _delivered_provides_text():
+    """拼出当前已交付业务模块及其 provides 符号,供组合根修复时给 subagent 参考。"""
+    lines = []
+    for st in SUBTASKS:
+        mm = st.get("manifest", {})
+        if mm.get("module") == "main.py":
+            continue
+        mod = mm.get("module", "?")
+        provides = mm.get("provides") or []
+        pv = "; ".join(str(p) for p in provides) if provides else "(未在契约声明 provides)"
+        lines.append(f"- {mod}: {pv}")
+    return "\n".join(lines) if lines else "(无已交付业务模块)"
+
+
 def _repair_module(st, error_text):
-    """用云端 subagent 修复单个子任务(原地更新 SUBTASKS 条目)。"""
+    """用云端 subagent 修复单个子任务(原地更新 SUBTASKS 条目)。
+    MAIN 条目(组合根 main.py)特判:带已交付模块符号清单,让 subagent 重写 main.py
+    正确引用这些符号(缺失功能在 main.py 内联实现),从而自愈组合根 import 错误。"""
     manifest = st.get("manifest", {})
+    if st.get("id") == MAIN_SUBTASK_ID:
+        repair = {
+            "original_task": st.get("task") or "组合根 main.py（导入各业务模块、串起整个项目流程）",
+            "current_code": manifest.get("code", ""),
+            "error": (
+                "【已交付的模块与提供的符号 —— 组合根必须只引用这些;缺失的功能请在 main.py 内联实现】\n"
+                + _delivered_provides_text()
+                + "\n\n【报错 / 校验失败信息】\n" + error_text
+            ),
+        }
+        delegate(
+            "修复组合根 main.py",
+            tier="pro",
+            name="main.py",
+            contract={"provides": [], "depends_on": []},
+            repair=repair,
+            replace_id=st.get("id"),
+        )
+        return
     repair = {
         "original_task": st.get("task") or manifest.get("summary") or "",
         "current_code": manifest.get("code", ""),
@@ -730,13 +796,16 @@ def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
         log.append(f"   🔧 修复轮次 {rnd}/{rounds}: {len(fails)} 个失败点")
         targets = []
         for f in fails:
-            # 优先用错误里解析出的精确符号(如 auth.login)定位归属模块;
-            # main.py 入口失败但符号指向 auth.login 时,归属 auth 而非 main。
+            # 组合根(main.py)入口失败:直接归属 MAIN 条目,由重写修复(不再静默失败)
             sym = f.get("symbol")
             owner = None
-            if sym and "." in sym:
+            if f.get("module") == "main.py":
+                owner = "main.py"
+            elif sym and "." in sym:
+                # 优先用错误里解析出的精确符号(如 auth.login)定位归属模块;
+                # main.py 入口失败但符号指向 auth.login 时,归属 auth 而非 main。
                 owner = sym.split(".", 1)[0]
-            elif f.get("module") and f["module"] != "main.py":
+            elif f.get("module"):
                 owner = f["module"][:-3] if f["module"].endswith(".py") else f["module"]
             if not owner:
                 owner = _module_from_traceback(f.get("error", ""), module_names)
@@ -756,7 +825,7 @@ def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
         full_err = "\n".join(f.get("error", "") for f in fails)[:3000]
         for st in targets:
             _repair_module(st, full_err)
-        smoke.assemble(out_dir, SUBTASKS, MAIN_CODE)  # 用修复后的代码重新组装
+        smoke.assemble(out_dir, [st for st in SUBTASKS if st.get("manifest", {}).get("module") != "main.py"], _get_main_code())  # 用修复后的代码重新组装(业务模块 + 最新 main.py)
         log.append("     - 已用修复后的代码重新组装项目")
         ok, fails = check_fn(out_dir)
         if ok:
