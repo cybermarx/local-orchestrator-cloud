@@ -1296,7 +1296,8 @@ def _split_and_recurse(task, name, contract, prev_manifest, tier, depth,
         delegate(agg_task, tier=tier, name=parent,
                  provides=parent_provides, depends_on=child_provides,
                  _depth=MAX_DELEGATE_DEPTH,   # 深度到顶:强制出代码,聚合不再拆
-                 replace_id=replace_id)       # repair 重写:聚合顶替原失败条目(保契约映射)
+                 replace_id=replace_id,
+                 _phase="aggregate")          # 聚合=短输出,hybrid 下走本地
         agg_note = f" + 聚合模块 {parent}"
 
     tag = f"[{name}] " if name else ""
@@ -1304,34 +1305,62 @@ def _split_and_recurse(task, name, contract, prev_manifest, tier, depth,
             f"({', '.join(child_names)}){agg_note},均已存入侧边存储(不占上下文)")
 
 
+HYBRID = os.environ.get("AGENT_HYBRID", "1").lower() in ("1", "true", "yes", "on")
+
+
+def _sf_ready():
+    return bool(SILICONFLOW_API_KEY)
+
+
+def _resolve_backend(backend):
+    """按后端名解析 (router, chat_fn, tries, timeout)。"""
+    if backend == "ollama":
+        return ROUTER_LOCAL, ollama_subagent_chat, LOCAL_DELEGATE_TRIES, LOCAL_TIMEOUT
+    if backend == "siliconflow":
+        return ROUTER_SF, siliconflow_chat, MAX_DELEGATE_TRIES, DELEGATE_TIMEOUT
+    return ROUTER, nvidia_chat, MAX_DELEGATE_TRIES, DELEGATE_TIMEOUT
+
+
+def _phase_backend(phase):
+    """混合模式(默认:非 --local 且硅基流动已配置)按步骤类型路由后端:
+    长输出(gen 模块代码 / repair 修复产出)→ 云端 SiliconFlow,免 IQ2_M 截断;
+    短决策(diag 诊断 / split 拆分 / aggregate 聚合)→ 本地 35B,省 API 成本且思考链装得下。
+    --local(DELEGATE_BACKEND=ollama)→ 一切本地;AGENT_HYBRID=0 → 一切跟随 DELEGATE_BACKEND。"""
+    if DELEGATE_BACKEND != "ollama" and HYBRID and _sf_ready():
+        if phase in ("gen", "repair"):
+            return "siliconflow"
+        if phase in ("diag", "split", "aggregate"):
+            return "ollama"
+    return DELEGATE_BACKEND
+
+
 def delegate(task: str, tier: str = "flash", name: str = None,
              provides: list = None, depends_on: list = None,
-             repair: dict = None, replace_id: int = None, _depth: int = 0) -> str:
+             repair: dict = None, replace_id: int = None, _depth: int = 0,
+             _phase: str = None) -> str:
     """把子任务派给云端 subagent(延迟感知路由器 + 单轮内跨模型 failover)。
     provides/depends_on 为编排器预先设计的契约(可选);传给 subagent 作接口约束,总目标不传入。
     repair: 修复模式,传 {"original_task","current_code","error"} 让 subagent 基于现有代码修正(总目标仍不传)。
     replace_id: 指定则原地更新该 SUBTASKS 条目(用于修复),否则追加新条目。
+    _phase: 内部用,标记步骤类型(gen/repair/diag/split/aggregate),混合模式据此路由后端。
     单轮内若某模型超时/失败会切换到下一个候选,避免反复卡在同一个过载模型上。"""
-    backend = DELEGATE_BACKEND
-    if backend == "ollama":
-        router, chat_fn = ROUTER_LOCAL, ollama_subagent_chat
-        tries, tmo = LOCAL_DELEGATE_TRIES, LOCAL_TIMEOUT
-    elif backend == "siliconflow":
-        router, chat_fn = ROUTER_SF, siliconflow_chat
-        tries, tmo = MAX_DELEGATE_TRIES, DELEGATE_TIMEOUT
-    else:
-        router, chat_fn = ROUTER, nvidia_chat
-        tries, tmo = MAX_DELEGATE_TRIES, DELEGATE_TIMEOUT
+    phase = _phase or ("repair" if repair else "gen")
+    backend = _phase_backend(phase)
+    router, chat_fn, tries, tmo = _resolve_backend(backend)
+    # 短决策后端(诊断/拆分)与长输出后端解耦:hybrid 下诊断/拆分走本地,修复产出走云端
+    diag_backend = _phase_backend("diag")
+    diag_router, diag_chat, _, diag_tmo = _resolve_backend(diag_backend)
     last_err = "未知错误"
     contract = None
     if provides or depends_on:
         contract = {"provides": provides or [], "depends_on": depends_on or []}
     tried = set()  # 本轮回避:同一模型本轮不再重试
     label = name or task[:14]
-    # 两阶段修复(仅本地 ollama):先诊断(开思考·短输出),再据诊断决定"递归重写"还是"局部小修"。
+    # 两阶段修复:先诊断(开思考·短输出),再据诊断决定"递归重写"还是"局部小修"。
     # 化解"想开思考但长输出会撑爆窗口"的假两难——诊断与修复本是两种相反性质的工作,拆开就没了。
-    if repair and TWO_STAGE_REPAIR and chat_fn is ollama_subagent_chat:
-        diag = _diagnose(repair, contract, router, chat_fn, tier, tmo, label)
+    # 诊断永远走短决策后端(local);修复产出按 phase 路由(hybrid 下=云端,免截断)。
+    if repair and TWO_STAGE_REPAIR and diag_chat is ollama_subagent_chat:
+        diag = _diagnose(repair, contract, diag_router, diag_chat, tier, diag_tmo, label)
         if diag:
             # 大改/重写 且 原地修复(replace_id) 且深度未满 → 把该模块当成一次全新 delegate,
             # 递归拆子模块 + 短聚合模块顶替原条目(保持 module/provides 契约映射不破)。
@@ -1340,7 +1369,7 @@ def delegate(task: str, tier: str = "flash", name: str = None,
                 rewritten = _split_and_recurse(
                     repair.get("original_task", task), name, contract,
                     {"code": repair.get("current_code", ""), "truncated": False},
-                    tier, _depth, router, chat_fn, tmo, replace_id=replace_id)
+                    tier, _depth, diag_router, diag_chat, diag_tmo, replace_id=replace_id)
                 if rewritten is not None:
                     tag = f"[{name}] " if name else ""
                     return f"{tag}子任务#{replace_id} 诊断判定需重写 → {rewritten}"
@@ -1383,7 +1412,7 @@ def delegate(task: str, tier: str = "flash", name: str = None,
                     and _depth < MAX_DELEGATE_DEPTH and _too_big(manifest)):
                 recursed = _split_and_recurse(
                     task, name, contract, manifest, tier, _depth,
-                    router, chat_fn, tmo)
+                    diag_router, diag_chat, diag_tmo)  # 拆分决策=短输出,走本地(hybrid)
                 if recursed is not None:
                     return recursed
             if replace_id is not None:
@@ -2353,7 +2382,10 @@ def fix_common_errors_prompt(proj: str = "项目") -> str:
 
 _MANUAL = """\
 使用示例:
-  python ollama_agent.py --local "写一个 py 脚本..."                # 单次任务(全本地,串行递归)
+  python ollama_agent.py --local "写一个 py 脚本..."                # 全本地(编排器+subagent 都 35B)
+  python ollama_agent.py "写一个 py 脚本..."                        # 混合模式(默认):编排器本地35B,
+                                                                   #   模块生成/修复产出→云端 SiliconFlow,
+                                                                   #   诊断/拆分/聚合→本地;AGENT_HYBRID=0 则全云端
   python ollama_agent.py --local --improve 项目目录 "优化这里..."     # 目录模式:扫顶层 .py 载入侧边存储
   python ollama_agent.py --local --improve 某个文件.py "重构它"       # 单文件模式:只载入这一份
   python ollama_agent.py --local --fix-project 项目目录              # 项目回喂:巡检并修复常见错误
@@ -2374,7 +2406,8 @@ _MANUAL = """\
 环境变量(可选):
   AGENT_NUM_CTX 编排器上下文窗口(默认8192)  AGENT_SUB_CTX_MAX 放大上限(默认24576,8GB显存勿再调大)
   AGENT_BUDGET 压缩触发预算  AGENT_CONTRACT_CHECK 契约校验开关  AGENT_GUARD_SHADOW 影子模块告警
-  AGENT_MAX_ORCH_DEPTH 分层子编排器深度上限(默认2)
+  AGENT_MAX_ORCH_DEPTH 分层子编排器深度上限(默认2)  AGENT_HYBRID 混合模式开关(默认1,0=全跟随后端)
+  SILICONFLOW_API_KEY 硅基流动密钥(env 或 local_config.json)  AGENT_SILICONFLOW_FLASH/PRO 云端模型清单
 """
 
 
@@ -2511,6 +2544,8 @@ def main():
         backend_src = _KEY_SOURCE or "无"
         backend_router = ROUTER
     print(f"   工具: delegate(云端subagent/{backend_name}) + assemble(组装+冒烟) + verify | 档位: flash={len(backend_flash)} pro={len(backend_pro)}")
+    if DELEGATE_BACKEND != "ollama" and HYBRID and _sf_ready():
+        print(f"   ⚡ 混合模式: 编排器=本地35B · 模块生成/修复产出→云端{backend_name} · 诊断/拆分/聚合→本地(AGENT_HYBRID=0 可关)")
     if not backend_key:
         print(f"   ⚠ 未检测到 {backend_name} API key —— delegate 将报错,请先设置对应环境变量或写入 local_config.json")
     else:
