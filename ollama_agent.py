@@ -95,6 +95,22 @@ MAX_MODULE_LINES = int(os.environ.get("AGENT_MAX_MODULE_LINES", "60"))
 MAX_MAIN_LINES = int(os.environ.get("AGENT_MAX_MAIN_LINES", "40"))
 MAX_TEST_LINES = int(os.environ.get("AGENT_MAX_TEST_LINES", "20"))
 
+# --- 递归分治 delegate(任务过大→subagent 自拆成更小子任务,还大则继续拆) ------
+# 触发条件:code 回来后被判"过大"(截断/语法错/超行数)。深度到顶强制出代码,保证收敛。
+# 本地串行下每深一层调用数 ×N,默认深度 2(拆一层)以控成本;设 0 关闭递归。
+MAX_DELEGATE_DEPTH = int(os.environ.get("AGENT_MAX_DELEGATE_DEPTH", "2"))
+SPLIT_MIN_SUBTASKS = int(os.environ.get("AGENT_SPLIT_MIN", "2"))   # 拆分至少几块
+SPLIT_MAX_SUBTASKS = int(os.environ.get("AGENT_SPLIT_MAX", "4"))   # 拆分最多几块(控爆炸)
+
+# --- 选择性推理 ------------------------------------------------------------
+# 思考链在本 GGUF 上恒 8K+ token,且与输出共享 num_ctx。故只在"决策/规划"这类
+# 输出短的步骤开思考(装得下思考+短输出);"写代码"这类长输出步骤一律关思考,
+# 否则思考撑爆窗口→content 为空(上一轮修过的 bug)。开关逐调用即时生效、调用完即
+# 失效(每次请求无状态传 think),不存在"忘了关"的残留。
+THINK_ON_SPLIT = os.environ.get("AGENT_THINK_ON_SPLIT", "1").lower() in ("1", "true", "yes", "on")
+THINK_ON_REPAIR = os.environ.get("AGENT_THINK_ON_REPAIR", "0").lower() in ("1", "true", "yes", "on")
+THINK_NUM_CTX = int(os.environ.get("AGENT_THINK_NUM_CTX", "16384"))  # 思考步骤的 num_ctx 下限
+
 # ----------------------------------------------------------------------------
 # NVIDIA 凭证加载(优先 env,否则回退读取常见 Claude/WorkBuddy config)
 # ----------------------------------------------------------------------------
@@ -377,11 +393,35 @@ SUBAGENT_SYS = """你是一个代码 subagent。你只负责完成分配给你�
 - 只输出 JSON。
 """
 
-# 粒度上限注入 prompt(两段 prompt 都含字面花括号,不能用 f-string,故用占位符替换)
+SUBAGENT_SPLIT_SYS = """你是一个任务拆分器。你刚收到的这个子任务**太大**,一个 ≤%MAXMOD% 行的模块装不下(可能被截断或职责过多)。
+你现在的工作**不是写代码**,而是把它拆成 %SPLITMIN%~%SPLITMAX% 个更小、职责单一的子任务,每个都能用 ≤%MAXMOD% 行代码独立完成。
+
+请只输出一个 JSON 对象(不要任何解释文字、不要用 markdown 代码块包裹):
+{
+  "subtasks": [
+    {
+      "name": "简短英文名,如 probe(会自动加父任务前缀,不要重复父名)",
+      "task": "这个子模块具体要做什么,写清楚到能独立实现",
+      "provides": ["本子模块对外提供的符号,格式 'func(args)->ret'"],
+      "depends_on": ["依赖的兄弟子模块符号,格式 '兄弟name:func',没有则留空"]
+    }
+  ]
+}
+要求:
+- 拆成 %SPLITMIN%~%SPLITMAX% 个子任务,每个职责单一、可用 ≤%MAXMOD% 行完成。
+- 子任务之间用 provides/depends_on 串成清晰的数据流(前一个的产出作为后一个的输入)。
+- 必须覆盖原任务的全部职责,不遗漏、不新增无关功能。
+- **绝不输出任何代码**,只输出这份拆分计划(计划很短,不会被截断)。
+- 只输出 JSON。
+"""
+
+# 粒度上限注入 prompt(prompt 含字面花括号,不能用 f-string,故用占位符替换)
 for _ph, _v in (("%MAXMOD%", MAX_MODULE_LINES), ("%MAXMAIN%", MAX_MAIN_LINES),
-                ("%MAXTEST%", MAX_TEST_LINES)):
+                ("%MAXTEST%", MAX_TEST_LINES),
+                ("%SPLITMIN%", SPLIT_MIN_SUBTASKS), ("%SPLITMAX%", SPLIT_MAX_SUBTASKS)):
     SYSTEM_PROMPT = SYSTEM_PROMPT.replace(_ph, str(_v))
     SUBAGENT_SYS = SUBAGENT_SYS.replace(_ph, str(_v))
+    SUBAGENT_SPLIT_SYS = SUBAGENT_SPLIT_SYS.replace(_ph, str(_v))
 
 
 # ----------------------------------------------------------------------------
@@ -640,6 +680,64 @@ def subagent_repair_messages(repair, contract=None):
     ]
 
 
+def subagent_split_messages(task, contract=None, prev_manifest=None):
+    """递归分治:任务过大时,让同一 subagent 把它拆成更小子任务(只输出计划,不写代码)。
+    总目标仍不传入——subagent 只在自己这块子目标范围内拆分。"""
+    parts = [f"[要拆分的子目标]\n{task}"]
+    if contract:
+        provides = contract.get("provides") or []
+        if provides:
+            parts.append("[原本要求提供的接口 provides(拆分后由各子模块合起来满足)]\n" +
+                         "\n".join(f"- {p}" for p in provides))
+    if prev_manifest is not None:
+        if prev_manifest.get("truncated"):
+            why = "被截断/不完整"
+        else:
+            why = f"{_code_lines(prev_manifest.get('code', ''))} 行,超出上限"
+        parts.append(f"[为何要拆] 上次直接实现产出的代码{why},说明任务过大,必须拆小。")
+    return [
+        {"role": "system", "content": SUBAGENT_SPLIT_SYS},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+
+
+def parse_split_output(text):
+    """解析拆分计划,返回 [{name,task,provides,depends_on}, ...](解析失败或无子任务返回 [])。"""
+    if not text:
+        return []
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+        t = re.sub(r"\n?```$", "", t).strip()
+    obj = {}
+    try:
+        obj = json.loads(t)
+    except Exception:
+        m = re.search(r"\{.*\}", t, re.S)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+            except Exception:
+                obj = {}
+    subs = obj.get("subtasks") if isinstance(obj, dict) else None
+    if not isinstance(subs, list):
+        return []
+    out = []
+    for s in subs:
+        if not isinstance(s, dict):
+            continue
+        task = (s.get("task") or "").strip()
+        if not task:
+            continue
+        out.append({
+            "name": (s.get("name") or "").strip(),
+            "task": task,
+            "provides": s.get("provides") or [],
+            "depends_on": s.get("depends_on") or [],
+        })
+    return out
+
+
 def _wait_printer(stop, model, label, interval=20):
     """在阻塞的网络调用期间周期性打印等待提示,避免看起来像卡死。"""
     waited = 0
@@ -673,9 +771,100 @@ def _grain_warning(manifest):
     return (" | ⚠ " + " ; ".join(notes)) if notes else ""
 
 
+def _too_big(manifest):
+    """判定 subagent 产出是否"过大到该拆"——与 _grain_warning 同源:截断/语法错/超行。"""
+    code = manifest.get("code", "") or ""
+    if manifest.get("truncated"):
+        return True
+    if _code_lines(code) > MAX_MODULE_LINES:
+        return True
+    try:
+        compile(code, manifest.get("module", "m.py"), "exec")
+    except SyntaxError:
+        return True
+    except Exception:
+        pass
+    return False
+
+
+def _subagent_once(router, chat_fn, tier, tmo, msgs, label, think=False):
+    """发起一次 subagent 调用(带等待提示),返回 content。用于拆分决策等辅助调用(不做 failover)。
+    think=True 仅对本地 ollama 后端开思考(云端后端思考由服务端控制,忽略此参数)。"""
+    model = router.select(tier)
+    stop = threading.Event()
+    wp = threading.Thread(target=_wait_printer, args=(stop, model, label), daemon=True)
+    t0 = time.perf_counter()
+    try:
+        print(f"   ⌛ 调用 {model} 拆分'{label}'…", flush=True)
+        wp.start()
+        extra = {"think": True} if (think and chat_fn is ollama_subagent_chat) else {}
+        content = chat_fn(model, msgs, timeout=tmo, **extra)
+        router.report(model, time.perf_counter() - t0, None)
+        return content
+    finally:
+        stop.set(); wp.join(timeout=1)
+
+
+def _split_and_recurse(task, name, contract, prev_manifest, tier, depth,
+                       router, chat_fn, tmo):
+    """任务过大→让同一 subagent 拆成子任务→逐个递归 delegate→(有 provides 则)生成聚合模块。
+    返回给编排器看的字符串;拆分未成功则返回 None,由调用方落回"直接使用原代码"。"""
+    parent = (name or task[:12]).strip() or "part"
+    print(f"   ⚙ 子任务'{parent}'判定过大,拆分分摊(深度 {depth + 1}/{MAX_DELEGATE_DEPTH})…", flush=True)
+    try:
+        content = _subagent_once(
+            router, chat_fn, tier, tmo,
+            subagent_split_messages(task, contract, prev_manifest), f"{parent}:split",
+            think=THINK_ON_SPLIT)  # 拆分=规划步骤,输出短,可安全开思考
+    except Exception as e:
+        print(f"   ⚠ 拆分调用失败({type(e).__name__}),落回直接使用原代码", flush=True)
+        return None
+    subs = parse_split_output(content)
+    if len(subs) < SPLIT_MIN_SUBTASKS:
+        print(f"   ⚠ 未得到有效拆分计划(<{SPLIT_MIN_SUBTASKS} 子任务),落回直接使用原代码", flush=True)
+        return None
+    subs = subs[:SPLIT_MAX_SUBTASKS]
+
+    child_names, child_provides, seen = [], [], set()
+    for i, s in enumerate(subs):
+        raw = s.get("name") or f"part{i + 1}"
+        cname = raw if raw.startswith(parent + "_") else f"{parent}_{raw}"
+        cname = re.sub(r"[^0-9A-Za-z_]", "_", cname) or f"{parent}_part{i + 1}"
+        while cname in seen:                # 防重名覆盖
+            cname += f"_{i + 1}"
+        seen.add(cname)
+        child_names.append(cname)
+        # 递归:子任务还太大会在 depth+1 层继续自拆
+        delegate(s["task"], tier=tier, name=cname,
+                 provides=s.get("provides"), depends_on=s.get("depends_on"),
+                 _depth=depth + 1)
+        # 取回该子模块实际 provides,供聚合模块 depends_on
+        st = next((x for x in reversed(SUBTASKS) if x.get("name") == cname), None)
+        got = (st.get("manifest", {}).get("provides") if st else None) or s.get("provides") or []
+        for p in got:
+            child_provides.append(p if ":" in p else f"{cname}:{p}")
+
+    # 聚合:父任务若对外承诺了 provides,拆分后须有人把它们合起来,否则破坏契约
+    agg_note = ""
+    parent_provides = (contract or {}).get("provides") or []
+    if parent_provides:
+        agg_task = (
+            f"编写聚合模块:import 下列兄弟子模块并组合它们,对外实现原接口。"
+            f"只做组装与串联,不要重新实现子模块内部逻辑,保持 ≤{MAX_MODULE_LINES} 行。\n"
+            f"[原任务]\n{task}")
+        delegate(agg_task, tier=tier, name=parent,
+                 provides=parent_provides, depends_on=child_provides,
+                 _depth=MAX_DELEGATE_DEPTH)   # 深度到顶:强制出代码,聚合不再拆
+        agg_note = f" + 聚合模块 {parent}"
+
+    tag = f"[{name}] " if name else ""
+    return (f"{tag}任务过大,已递归拆成 {len(child_names)} 个子模块"
+            f"({', '.join(child_names)}){agg_note},均已存入侧边存储(不占上下文)")
+
+
 def delegate(task: str, tier: str = "flash", name: str = None,
              provides: list = None, depends_on: list = None,
-             repair: dict = None, replace_id: int = None) -> str:
+             repair: dict = None, replace_id: int = None, _depth: int = 0) -> str:
     """把子任务派给云端 subagent(延迟感知路由器 + 单轮内跨模型 failover)。
     provides/depends_on 为编排器预先设计的契约(可选);传给 subagent 作接口约束,总目标不传入。
     repair: 修复模式,传 {"original_task","current_code","error"} 让 subagent 基于现有代码修正(总目标仍不传)。
@@ -706,12 +895,25 @@ def delegate(task: str, tier: str = "flash", name: str = None,
             print(f"   ⌛ 调用 {model} 生成子任务'{label}'…", flush=True)
             wp.start()
             msgs = subagent_repair_messages(repair, contract) if repair else subagent_messages(task, contract)
-            content = chat_fn(model, msgs, timeout=tmo)
+            # 修复=诊断步骤,可选开思考(默认关:修复输出含整段代码,长输出+思考有撑爆窗口风险);
+            # 写新模块=纯长输出,恒关思考。
+            extra = ({"think": True}
+                     if (repair and THINK_ON_REPAIR and chat_fn is ollama_subagent_chat) else {})
+            content = chat_fn(model, msgs, timeout=tmo, **extra)
             latency = time.perf_counter() - t0
             stop.set(); wp.join(timeout=1)
             router.report(model, latency, None)
             manifest = parse_subagent_output(content)
             warn = _grain_warning(manifest)
+            # 递归分治:任务过大(截断/语法错/超行)且深度未满、非修复模式 → 自拆分摊。
+            # 子任务还太大会在更深一层继续自拆,深度到顶强制出代码,天然收敛。
+            if (repair is None and replace_id is None
+                    and _depth < MAX_DELEGATE_DEPTH and _too_big(manifest)):
+                recursed = _split_and_recurse(
+                    task, name, contract, manifest, tier, _depth,
+                    router, chat_fn, tmo)
+                if recursed is not None:
+                    return recursed
             if replace_id is not None:
                 for st in SUBTASKS:
                     if st.get("id") == replace_id:
@@ -725,6 +927,7 @@ def delegate(task: str, tier: str = "flash", name: str = None,
             sid = len(SUBTASKS) + 1
             SUBTASKS.append({
                 "id": sid,
+                "name": name,
                 "task": task,
                 "manifest": manifest,
                 "contract": contract,
@@ -1208,29 +1411,31 @@ def _stitch(acc: str, nxt: str) -> str:
     return acc + nxt
 
 
-def _ollama_complete(model, messages, num_ctx, num_predict, temperature, timeout):
-    payload = {
-        "model": model,
-        "messages": messages,
-        "options": {"num_ctx": num_ctx, "temperature": temperature,
-                    "num_predict": num_predict,
-                    "enable_thinking": False, "think": False},
-        "stream": False,
-    }
+def _ollama_complete(model, messages, num_ctx, num_predict, temperature, timeout, think=False):
+    opts = {"num_ctx": num_ctx, "temperature": temperature, "num_predict": num_predict}
+    if think:
+        opts["think"] = True             # 决策/规划步骤:显式开思考(输出短,窗口装得下思考链)
+    else:
+        opts["enable_thinking"] = False  # 写代码步骤:关思考(think:false 才对本 GGUF 真正生效)
+        opts["think"] = False
+    payload = {"model": model, "messages": messages, "options": opts, "stream": False}
     resp = _ollama_raw(payload, timeout=timeout)
     return (resp.get("message", {}) or {}).get("content", "") or "", resp.get("done_reason", "")
 
 
-def ollama_subagent_chat(model, messages, timeout=None, use_json=True):
+def ollama_subagent_chat(model, messages, timeout=None, use_json=True, think=False):
     """本地 35B 兼任 subagent(串行递归)。截断则自动 prefill 续写,最多 MAX_CONTINUE 次。
-    签名与 nvidia_chat / siliconflow_chat 保持一致,便于 delegate 统一调度。"""
+    think=True 用于"拆分决策"等短输出的规划步骤(开思考并把 num_ctx 抬到 THINK_NUM_CTX
+    下限,装下 8K+ 思考链);写代码步骤保持 think=False。签名与 nvidia_chat /
+    siliconflow_chat 一致,便于 delegate 统一调度。"""
     timeout = timeout or LOCAL_TIMEOUT
+    base_ctx = max(SUB_NUM_CTX, THINK_NUM_CTX) if think else SUB_NUM_CTX
     acc, reason = "", ""
     for attempt in range(MAX_CONTINUE + 1):
         # 已有内容时把它作为 assistant prefill,让模型「接着写」而不是重新开始
         msgs = list(messages) + ([{"role": "assistant", "content": acc}] if acc else [])
         content, reason = _ollama_complete(
-            model, msgs, SUB_NUM_CTX, SUB_NUM_PREDICT, SUB_TEMPERATURE, timeout)
+            model, msgs, base_ctx, SUB_NUM_PREDICT, SUB_TEMPERATURE, timeout, think=think)
         if not content.strip():
             break
         acc = _stitch(acc, content)
@@ -1244,11 +1449,11 @@ def ollama_subagent_chat(model, messages, timeout=None, use_json=True):
     # 兜底:content 为空且因长度截断,多半是思考链(本 GGUF 即便 think:false 仍思考 8K+ token)
     # 吃光了 num_ctx 窗口。放大 num_ctx 给思考留空间,再试一次(不计入 MAX_CONTINUE 续写额度)。
     if not acc.strip() and reason == "length":
-        bigger = max(SUB_NUM_CTX, 32768)
-        if bigger > SUB_NUM_CTX:
+        bigger = max(base_ctx, 32768)
+        if bigger > base_ctx:
             print(f"   ↻ 疑似思考链耗光上下文窗口,放大 num_ctx={bigger} 重试一次…", flush=True)
             content, reason = _ollama_complete(
-                model, messages, bigger, SUB_NUM_PREDICT, SUB_TEMPERATURE, timeout)
+                model, messages, bigger, SUB_NUM_PREDICT, SUB_TEMPERATURE, timeout, think=think)
             if content.strip():
                 acc = content
                 if reason == "length":
@@ -1429,6 +1634,10 @@ def main():
 
     print(f"🦙 本地编排器 | 模型={MODEL} | num_ctx={NUM_CTX} | Ollama={OLLAMA_URL}")
     print(f"   compact: mode={SUMMARY_MODE if USE_SUMMARY else 'off'} | thinking={'on' if ENABLE_THINKING else 'off'} | 预算={BUDGET} token")
+    print(f"   选择性推理: 顶层规划={'on' if ENABLE_THINKING else 'off'}"
+          f" · 拆分决策={'on' if THINK_ON_SPLIT else 'off'}"
+          f" · 修复诊断={'on' if THINK_ON_REPAIR else 'off'}"
+          f" · 写代码=off(恒关) | 思考步骤 num_ctx≥{THINK_NUM_CTX}")
     print(f"   输出预算: 编排器≤{ORCH_MAX_PREDICT} / subagent≤{SUB_NUM_PREDICT} token"
           f" | 截断自动续写×{MAX_CONTINUE}"
           f" | 粒度上限: 模块{MAX_MODULE_LINES}行 main{MAX_MAIN_LINES}行 测试{MAX_TEST_LINES}行")
