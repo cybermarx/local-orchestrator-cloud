@@ -89,6 +89,12 @@ SUB_NUM_PREDICT = int(os.environ.get("AGENT_SUB_NUM_PREDICT", "4096"))
 SUB_TEMPERATURE = float(os.environ.get("AGENT_SUB_TEMP", "0.3"))  # 写代码宜低温,减少退化
 MAX_CONTINUE = int(os.environ.get("AGENT_MAX_CONTINUE", "3"))     # 截断后最多续写几次
 LOCAL_TIMEOUT = int(os.environ.get("AGENT_LOCAL_TIMEOUT", "900"))
+# 空内容兜底时放大 num_ctx 的上限。8GB 显存 + IQ2_M 35B 上,32768 会 OOM 让 Ollama 崩(HTTP 500),
+# 故默认降到 24576;放大调用若仍抛错(OOM/500)会被捕获,不再连累整个 delegate。
+SUB_CTX_MAX = int(os.environ.get("AGENT_SUB_CTX_MAX", "24576"))
+# 影子模块守卫:subagent/编排器若把模块命名成与 stdlib 或已安装第三方库同名(如 requests.py),
+# 本地文件会遮蔽真库,且生成代码常 import 同名库 → 自引用递归。默认开启,delegate 时告警。
+GUARD_STDLIB_SHADOW = os.environ.get("AGENT_GUARD_SHADOW", "1").lower() in ("1", "true", "yes", "on")
 
 # --- 粒度硬约束(低比特量化下,缩短单次输出是保证完整性的主要手段) -----------
 MAX_MODULE_LINES = int(os.environ.get("AGENT_MAX_MODULE_LINES", "60"))
@@ -348,7 +354,7 @@ SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
 - delegate(task, tier?, name?, provides?, depends_on?): 把一个子任务的**子目标**派给云端 subagent 完成。返回简短指针——真实成果存入「侧边存储」,不占对话上下文。
 - write_main(project_name, main_code): 你(编排器,掌握总目标)亲自写**主函数 main.py(组合根)**。它 import 各模块、按你设计的契约调用它们,把整个项目串起来。main.py 必须严格按 provides/depends_on 约定的**名字与签名**调用各模块符号——这是「去 linker」设计下唯一需要你保证接口一致的地方(同目录放文件即可,import 会自行接线)。这里只暂存代码,落盘由 assemble 统一做。
 - assemble(project_name): 所有模块 delegate 完成、且你已 write_main 后调用。它把所有模块文件 + main.py 落到同一目录(无需接线,Python import 即 linker),然后做「导入全部模块 + 真正调用 main 入口」的契约感知冒烟;对冒烟失败(符号名/签名漂移、缺失模块、循环依赖)自动启动修复闭环,返回项目树。
-- verify(project_name, test_code, name?): 【可选】assemble 后,用一个**短**Python 片段对生成的项目做**一片**集成校验(你掌握总目标,应写出能验证核心流程的断言,如 register 后 login 能拿到 token)。失败会自动回灌 subagent 修复并重新组装。**校验要分片**:一次只验一个切面,分多次调用,用 name 标注这片验什么。
+- verify(project_name, test_code, name?): 【可选】assemble 后,用一个**短**Python 片段对生成的项目做**一片**集成校验(你掌握总目标,应写出能验证核心流程的断言,如 register 后 login 能拿到 token)。失败会自动回灌 subagent 修复并重新组装。**校验要分片**:一次只验一个切面,分多次调用,用 name 标注这片验什么。**防作弊硬约束**:你写的断言必须是**真实校验**(如 `assert "token" in output`、`assert user.id == 1`),**严禁**在 verify 失败后把断言改弱来强行变绿(如 `assert len(output)>10 or "Error" not in output`、`assert True`、只用 `len(x)>0` 验存在性不验内容);同一 name 重复 verify 应修正测试逻辑或修复项目,而不是放宽断言。
 
 工作方式(契约优先,去 linker):
 1. 理解用户的**总目标**;
@@ -366,7 +372,7 @@ SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
 你和 subagent 可能都跑在本机的低比特量化模型上,**单次输出越长,被截断成半截代码的概率越高**。所以:
 - **每个模块**:单一职责、只暴露 1-3 个符号、目标 ≤%MAXMOD% 行。宁可多拆 3 个小模块,也绝不要 1 个大模块。若发现某个子目标要写很多代码,先把它再拆开。
 - **main.py**:只做「import 各模块 + 按契约把流程串起来」,目标 ≤%MAXMAIN% 行。**任何实际逻辑都要下沉成新模块 delegate 出去**,不要写在 main.py 里。
-- **verify**:不要写一个大测试。每次只验**一个切面**(≤%MAXTEST% 行),分多次调用并用 name 标注(如 "注册流程"、"登录流程")。
+- **verify**:不要写一个大测试。每次只验**一个切面**(≤%MAXTEST% 行),分多次调用并用 name 标注(如 "注册流程"、"登录流程")。**断言必须真实**:写 `assert` 校验核心行为(如 `assert result.ok`),**绝不允许断言恒真或只验存在性来强行通过**——verify 失败说明项目可能真有问题,应去修项目或改测试逻辑,不要放宽断言。
 - 若工具返回里出现「⚠ …被截断 / 语法错误 / 超过上限行」,说明**这一块太大了**:把它拆成更小的子目标重新 delegate,不要原样重试。
 
 规则:
@@ -375,6 +381,7 @@ SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
 - 若 delegate 返回错误,换种描述重试,或把任务拆更细再 delegate。
 - 你无法自己联网;需要实时信息时,云端模型会用其训练知识回答(可能非最新),请向用户说明。
 - 最终回答要简洁,引用 assemble/verify 返回的项目路径与校验结论。
+- **verify 防作弊**:绝不允许为了「让校验变绿」而把断言改弱——同一 name 重复 verify 时若仍失败,应修正测试逻辑或把失败信息回灌修复项目,而不是把断言改成恒真/弱化(如 `assert len(output)>0`、`assert "Error" not in output`)。被系统判定为「过弱断言」的校验会被标记警告,不算真实通过。
 """
 
 SUBAGENT_SYS = """你是一个代码 subagent。你只负责完成分配给你的**单个子任务**,你**不知道、也不需要知道**整个项目的总目标。
@@ -504,7 +511,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "verify",
-            "description": "对已 assemble 的项目做【一片】集成校验:写一个简短 Python 片段导入生成模块并对某一个核心流程断言(如 register 后 login 能拿到 token)。校验失败会自动把报错回灌给 subagent 修复并重新组装。请分多次调用,每次只验一个切面——一次写太长会被输出上限截断,而截断的测试会被误判成项目 bug。",
+            "description": "对已 assemble 的项目做【一片】集成校验:写一个简短 Python 片段导入生成模块并对某一个核心流程做**真实断言**(如 register 后 login 能拿到 token)。校验失败会自动把报错回灌给 subagent 修复并重新组装。请分多次调用,每次只验一个切面——一次写太长会被输出上限截断,而截断的测试会被误判成项目 bug。**防作弊硬约束**:断言必须是真实校验(校验具体行为/内容),严禁把失败测试改成恒真/弱化断言(如 `assert len(output)>10 or \"Error\" not in output`、`assert True`、只用 `len(x)>0` 验存在性不验内容)来强行通过;同一 name 重复 verify 应修正测试逻辑或修复项目,而非放宽断言。命中过弱断言的校验会被系统标记警告。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -832,11 +839,58 @@ def _code_lines(code):
     return len([ln for ln in (code or "").splitlines() if ln.strip()])
 
 
+def _norm_module_name(name):
+    """把请求的 name 规范成合法的 .py 文件名(取 basename、补 .py)。"""
+    if not name:
+        return None
+    base = os.path.basename(str(name).strip())
+    if not base:
+        return None
+    return base if base.endswith(".py") else base + ".py"
+
+
+_STDLIB_NAMES = set(getattr(sys, "stdlib_module_names", set()))
+
+
+def _shadow_warning(module_name):
+    """检测模块名是否与 stdlib 或已安装第三方库同名 → 本地文件会遮蔽真库。
+    典型灾难:delegate 一个 requests.py,里面 import requests 实为导入自己 → 自引用递归,
+    被上层 except 吞掉后静默返回默认值。返回告警串(空串表示无冲突)。"""
+    if not GUARD_STDLIB_SHADOW or not module_name:
+        return ""
+    top = os.path.basename(module_name)
+    top = top[:-3] if top.endswith(".py") else top
+    if not top or top == "main":
+        return ""
+    kind = None
+    if top in _STDLIB_NAMES:
+        kind = "标准库"
+    else:
+        try:
+            import importlib.util
+            # 屏蔽项目自身目录,避免把已交付的同名业务模块误报为第三方
+            spec = importlib.util.find_spec(top)
+            if spec is not None and getattr(spec, "origin", None) not in (None, "namespace"):
+                origin = spec.origin or ""
+                if "site-packages" in origin or "dist-packages" in origin:
+                    kind = "已安装第三方库"
+        except Exception:
+            pass
+    if not kind:
+        return ""
+    return (f"模块名 '{top}' 与{kind}同名,本地文件会遮蔽真库(import {top} 将导入你自己→"
+            f"极易自引用递归并被上层 except 静默吞掉)。请改名(如 {top}_client.py)或直接 import 真库,"
+            f"不要 delegate 同名模块")
+
+
 def _grain_warning(manifest):
     """粒度 / 完整性体检。语法错误是「被截断」最确定的信号——低比特量化下,
     与其让半截代码流进 assemble 再去猜,不如当场告诉编排器:拆得更小、重来。"""
     notes = []
     code = manifest.get("code", "") or ""
+    sw = _shadow_warning(manifest.get("module"))
+    if sw:
+        notes.append(sw)
     if manifest.get("truncated"):
         notes.append("输出被截断(已从残缺 JSON 抢救,可能不完整)")
     n = _code_lines(code)
@@ -1034,6 +1088,12 @@ def delegate(task: str, tier: str = "flash", name: str = None,
             stop.set(); wp.join(timeout=1)
             router.report(model, latency, None)
             manifest = parse_subagent_output(content)
+            # 请求的 name 是权威文件名:模型自作主张改名(如请求 fetch.py 却返回 rouge_fetcher.py)
+            # 会导致落盘文件名与 main 的 import 不符 → 孤儿文件 + 编排器重复 delegate 补名。
+            # 强制以 name 覆盖 module,一次到位,不再产生孤儿。
+            _nm = _norm_module_name(name)
+            if _nm:
+                manifest["module"] = _nm
             warn = _grain_warning(manifest)
             # 递归分治:任务过大(截断/语法错/超行)且深度未满、非修复模式 → 自拆分摊。
             # 子任务还太大会在更深一层继续自拆,深度到顶强制出代码,天然收敛。
@@ -1381,6 +1441,34 @@ def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
     return log, ok, missing
 
 
+# 校验防作弊:低比特量化模型可能在 verify 失败后把断言改弱(如把失败测试改成
+# `len(output)>10 or "Error" not in output`)来强行变绿。这里做轻量静态扫描,命中可疑
+# 模式就在结果里告警,提醒编排器这可能不是真实通过——失败应去修项目/改测试逻辑,而非放宽断言。
+_WEAK_ASSERT_PATTERNS = [
+    (re.compile(r'or\s+["\']Error["\']\s+not\s+in', re.I),
+     '"... or Error 不在输出里" 兜底:任何输出都能通过,失去校验意义'),
+    (re.compile(r'\bassert\s+True\b', re.I),
+     'assert True 恒真,无校验意义'),
+    (re.compile(r'\bassert\s+\d+\b'),
+     'assert <数字常量> 恒真,无校验意义'),
+    (re.compile(r'\bassert\s+len\([^)]*\)\s*>\s*0\b'),
+     '仅用 len()>0 验存在性,不校验内容:空壳/占位也能通过'),
+]
+
+def _warn_weak_assert(test_code: str) -> str:
+    """扫描 test_code,若命中过弱断言模式返回告警文本(空串表示未发现)。"""
+    if not test_code:
+        return ""
+    hits = []
+    for pat, msg in _WEAK_ASSERT_PATTERNS:
+        if pat.search(test_code):
+            hits.append(msg)
+    if not hits:
+        return ""
+    return ("⚠ [verify 防作弊] 检测到可能过弱的断言,请确认其确实在验证核心行为而非强行变绿:"
+            + "".join(f"\n   - {h}" for h in hits)
+            + "\n   若校验失败,应修正测试逻辑或修复项目,不要放宽断言。")
+
 def verify(project_name: str, test_code: str, name: str = None) -> str:
     """对已 assemble 的项目做一「片」集成校验。
     分片语义:每次只验一个切面(建议 ≤MAX_TEST_LINES 行),可多次调用。
@@ -1404,10 +1492,12 @@ def verify(project_name: str, test_code: str, name: str = None) -> str:
     n = _code_lines(test_code)
     over = (f" ⚠ 本片 {n} 行 > 建议上限 {MAX_TEST_LINES} 行,下次请拆更细"
             if n > MAX_TEST_LINES else "")
+    weak = _warn_weak_assert(test_code)  # 防作弊:扫描过弱/恒真断言
     try:
         ok, fails = _check_test(out_dir, test_code)
         if ok:
-            return f"{tag}✅ 集成校验通过({n} 行 | 项目: {project_name}){over}"
+            suffix = (f"{over}\n{weak}" if weak else over)
+            return f"{tag}✅ 集成校验通过({n} 行 | 项目: {project_name}){suffix}"
         lines = [f"{tag}⚠ 集成校验失败,启动自动修复闭环(项目: {project_name}){over}"]
         # 集成测试的 traceback 通常不点名模块,改用测试 import 的模块作为修复范围。
         # scope 统一存成 manifest 里的文件名(如 auth.py),与失败点/映射函数的口径一致。
@@ -1423,6 +1513,8 @@ def verify(project_name: str, test_code: str, name: str = None) -> str:
             lines.append("   ⚠ 缺失模块: " + ", ".join(sorted(missing)) +
                          " — 请用 delegate 创建后重新 assemble")
         lines.append("   " + ("✅ 修复后集成校验通过" if fixed else "⚠ 自动修复未完全解决,见上方失败点"))
+        if weak:
+            lines.append(weak)
         return "\n".join(lines)
     except Exception as e:
         return f"[verify 错误] {e}"
@@ -1579,15 +1671,21 @@ def ollama_subagent_chat(model, messages, timeout=None, use_json=True, think=Fal
     # 兜底:content 为空且因长度截断,多半是思考链(本 GGUF 即便 think:false 仍思考 8K+ token)
     # 吃光了 num_ctx 窗口。放大 num_ctx 给思考留空间,再试一次(不计入 MAX_CONTINUE 续写额度)。
     if not acc.strip() and reason == "length":
-        bigger = max(base_ctx, 32768)
+        bigger = max(base_ctx, SUB_CTX_MAX)
         if bigger > base_ctx:
             print(f"   ↻ 疑似思考链耗光上下文窗口,放大 num_ctx={bigger} 重试一次…", flush=True)
-            content, reason = _ollama_complete(
-                model, messages, bigger, SUB_NUM_PREDICT, SUB_TEMPERATURE, timeout, think=think)
-            if content.strip():
-                acc = content
-                if reason == "length":
-                    print(f"   ⚠ 放大后仍被长度截断,将尝试从残缺 JSON 中抢救代码", flush=True)
+            try:
+                content, reason = _ollama_complete(
+                    model, messages, bigger, SUB_NUM_PREDICT, SUB_TEMPERATURE, timeout, think=think)
+                if content.strip():
+                    acc = content
+                    if reason == "length":
+                        print(f"   ⚠ 放大后仍被长度截断,将尝试从残缺 JSON 中抢救代码", flush=True)
+            except Exception as e:
+                # 放大 num_ctx 常在小显存上 OOM 让 Ollama 崩(HTTP 500)。这里吞掉,
+                # 让流程落到"空内容"错误分支(可换更小子任务重试),而非炸穿整个 delegate。
+                print(f"   ⚠ 放大 num_ctx 重试失败({type(e).__name__}),多半是显存不足;"
+                      f"建议拆更小的子任务或降低 AGENT_SUB_CTX_MAX", flush=True)
     if not acc.strip():
         raise RuntimeError("本地 subagent 返回空内容")
     return acc
