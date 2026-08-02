@@ -11,7 +11,7 @@
    规划 / 调度。对话历史只放「指针」，永不撑爆上下文。
    带递归摘要压缩 maybe_compact（默认 Qwen3 思考 + 撑爆自动关思考兜底）。
 
-② 云端 subagent（NVIDIA 或 SiliconFlow，用 `AGENT_DELEGATE_BACKEND` 切换；本仓库默认 NVIDIA）
+② 云端 subagent（NVIDIA 或 SiliconFlow，用 `AGENT_DELEGATE_BACKEND` 切换；**本仓库默认 SiliconFlow**）
    把子目标 + 契约 作为一次性 /api/chat 请求发出，拿回 {module, code, provides, depends_on}。
    每个 subagent 不知道总目标（信息隔离），长上下文。
 
@@ -53,8 +53,11 @@ python ollama_agent.py "写一个带登录的博客系统"
 # 需要云端 subagent 时提供 NVIDIA key
 NVIDIA_API_KEY=nvapi-xxx python ollama_agent.py "写一个带登录的博客系统"
 
-# 临时改用 SiliconFlow 作云端后端(key 仅从环境变量读取,不写入本文件)
-SILICONFLOW_API_KEY=sk-xxx AGENT_DELEGATE_BACKEND=siliconflow python ollama_agent.py "写一个带登录的博客系统"
+# SiliconFlow 为默认后端,key 已放进 git-ignored 的 local_config.json,直接跑即可
+python ollama_agent.py "写一个带登录的博客系统"
+
+# 仍可用环境变量临时覆盖(优先级高于 local_config.json)
+SILICONFLOW_API_KEY=sk-yyy python ollama_agent.py "写一个带登录的博客系统"
 ```
 
 编排器会：理解总目标 → 设计模块契约 → 逐个 delegate → write_main 写组合根 → assemble 组装并冒烟 →（可选）verify 集成校验。
@@ -79,15 +82,17 @@ SILICONFLOW_API_KEY=sk-xxx AGENT_DELEGATE_BACKEND=siliconflow python ollama_agen
 - `AGENT_PROJECT_DIR`：项目输出目录（默认 `./projects`）
 - `AGENT_REPAIR_ROUNDS`：自动修复闭环最大轮次（默认 3）
 
-**SiliconFlow 后端（临时可切换，OpenAI 兼容）**：
-- `AGENT_DELEGATE_BACKEND`：默认 `nvidia`；设 `siliconflow` 即改用 SiliconFlow 作云端 subagent
-- `SILICONFLOW_API_KEY`：临时使用时设置（仅从环境变量读取，不写入本文件 / 不入库）
+**SiliconFlow 后端（默认云端 subagent 后端，OpenAI 兼容）**：
+- `AGENT_DELEGATE_BACKEND`：默认 `siliconflow`；设 `nvidia` 可切回 NVIDIA
+- `SILICONFLOW_API_KEY`：优先读环境变量；否则读项目根目录 git-ignored 的 `local_config.json`（避免每次手输）
+- subagent 模型**自动轮转**：flash 档候选间按延迟感知 + 轮转指针循环分配，不会永远只打第一个
 - `SILICONFLOW_BASE_URL`：默认 `https://api.siliconflow.cn/v1`
 - `AGENT_SILICONFLOW_FLASH` / `AGENT_SILICONFLOW_PRO`：SiliconFlow 候选模型
   （默认 flash=DeepSeek-V3 / Qwen3.5-35B-A3B / Qwen3.5-9B，pro=DeepSeek-V3.2 / DeepSeek-R1 / DeepSeek-V3.1-Terminus）
 
 ## 安全说明
 
-本仓库**不含任何密钥或配置文件**：`nvidia-proxy-config.json`、`settings.*.json`、`*.bat`、
-`.workbuddy/`、`.claude/`、`*.db`、`*.log` 等一律未提交。NVIDIA key 仅从运行时环境变量或本地
-config 读取，文档中的 `nvapi-xxx` 仅为占位示例。
+本仓库**不含任何密钥**：`local_config.json`（含 SiliconFlow key）、`nvidia-proxy-config.json`、`settings.*.json`、`*.bat`、
+`.workbuddy/`、`.claude/`、`*.db`、`*.log` 等一律未提交（`.gitignore` 白名单只跟踪 5 个源码文件）。
+SiliconFlow / NVIDIA key 仅从运行时环境变量或 git-ignored 的 `local_config.json` 读取，
+文档中的 `sk-xxx` / `nvapi-xxx` 仅为占位示例。

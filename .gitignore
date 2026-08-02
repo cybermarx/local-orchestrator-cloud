@@ -8,3 +8,6 @@
 !nvidia-claude-proxy.js
 !CLAUDE.md
 !README.md
+
+# 本地密钥 / 配置(含 API key,绝不入库)
+local_config.json

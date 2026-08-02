@@ -21,7 +21,7 @@ smoke.py 做「导入全部模块 + 真正调用 main 入口」的契约感知�
   python ollama_agent.py                 # 交互模式(像对话界面一样用)
   python ollama_agent.py "任务"          # 单次任务
   NVIDIA_API_KEY=nvapi-xxx python ollama_agent.py "写一个博客系统"
-  SILICONFLOW_API_KEY=sk-xxx python ollama_agent.py "写一个博客系统"   # 临时用 SiliconFlow 后端
+  SILICONFLOW_API_KEY=sk-xxx python ollama_agent.py "写一个博客系统"   # SiliconFlow 为默认后端(设 AGENT_DELEGATE_BACKEND=nvidia 可切回 NVIDIA);key 不写也可放 local_config.json
 
 环境变量:
   OLLAMA_URL / AGENT_MODEL / AGENT_NUM_CTX / AGENT_MAX_ITER / AGENT_TEMP / AGENT_THINKING / AGENT_SUMMARIZE / AGENT_SUMMARY_MODE / AGENT_SUMMARIZER_MODEL / AGENT_TRUNCATE_CAP / AGENT_KEEP_RECENT / AGENT_COMPACT_ROUNDS  (沿用原有)
@@ -30,8 +30,8 @@ smoke.py 做「导入全部模块 + 真正调用 main 入口」的契约感知�
   NVIDIA_BASE_URL       默认 https://integrate.api.nvidia.com/v1(也可由 config 的 url 字段回退)
   AGENT_NVIDIA_FLASH    默认 "deepseek-ai/deepseek-v4-flash, z-ai/glm-5.2, minimaxai/minimax-m3, stepfun-ai/step-3.7-flash"
   AGENT_NVIDIA_PRO      默认 "deepseek-ai/deepseek-v4-pro, nvidia/llama-3.1-nemotron-ultra-253b-v1"
-  AGENT_DELEGATE_BACKEND 默认 nvidia;可选 siliconflow(用 SiliconFlow 作云端 subagent 后端)
-  SILICONFLOW_API_KEY   临时用 SiliconFlow 时设置(仅从环境变量读取,不写入本文件 / 不入库)
+  AGENT_DELEGATE_BACKEND 默认 siliconflow(用 SiliconFlow 作云端 subagent 后端);设 nvidia 可切回 NVIDIA
+  SILICONFLOW_API_KEY   可选;优先读环境变量,否则读项目根目录 git-ignored 的 local_config.json(避免每次手输;不写入本文件 / 不入库)
   SILICONFLOW_BASE_URL  默认 https://api.siliconflow.cn/v1
   AGENT_SILICONFLOW_FLASH 默认 "deepseek-ai/DeepSeek-V3, Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-9B"
   AGENT_SILICONFLOW_PRO   默认 "deepseek-ai/DeepSeek-V3.2, deepseek-ai/DeepSeek-R1, deepseek-ai/DeepSeek-V3.1-Terminus"
@@ -123,6 +123,20 @@ def _load_nvidia_credentials():
     return "", None, None
 
 
+def _load_local_secret(name, cfg_path=None):
+    """从项目根目录的 git-ignored local_config.json 读取密钥/配置(避免每次手输)。
+    仅作环境变量的兜底;密钥不写入任何被 git 跟踪的源码文件。找不到或解析失败返回空串。"""
+    if cfg_path is None:
+        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local_config.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        v = data.get(name, "")
+        return v.strip() if isinstance(v, str) else ""
+    except Exception:
+        return ""
+
+
 _NVIDIA_API_KEY, _FALLBACK_URL, _KEY_SOURCE = _load_nvidia_credentials()
 NVIDIA_API_KEY = _NVIDIA_API_KEY
 NVIDIA_BASE_URL = (
@@ -145,8 +159,8 @@ MAX_DELEGATE_TRIES = int(os.environ.get("AGENT_DELEGATE_TRIES", "6"))
 # ----------------------------------------------------------------------------
 # SiliconFlow 后端(临时可切换的云端 subagent 后端,OpenAI 兼容 /chat/completions)
 # ----------------------------------------------------------------------------
-DELEGATE_BACKEND = os.environ.get("AGENT_DELEGATE_BACKEND", "nvidia").strip().lower() or "nvidia"
-SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "").strip()
+DELEGATE_BACKEND = os.environ.get("AGENT_DELEGATE_BACKEND", "siliconflow").strip().lower() or "siliconflow"
+SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "").strip() or _load_local_secret("SILICONFLOW_API_KEY")
 SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1").rstrip("/")
 SILICONFLOW_FLASH = [x.strip() for x in os.environ.get(
     "AGENT_SILICONFLOW_FLASH",
@@ -191,6 +205,7 @@ class ModelRouter:
     def __init__(self, flash, pro):
         self.tiers = {"flash": list(flash), "pro": list(pro)}
         self.stats = {}  # model -> {ema, fails, cooldown_until}
+        self._rr = 0     # 跨调用轮转指针,实现多模型自动切换(负载分散,而非永远打候选第一个)
 
     def _stat(self, m):
         return self.stats.setdefault(m, {"ema": 0.0, "fails": 0, "cooldown_until": 0.0})
@@ -209,9 +224,12 @@ class ModelRouter:
                        if m not in exclude and now >= self._stat(m)["cooldown_until"]] \
                       or [m for m in cands if m not in exclude] \
                       or list(cands)
-        # 优先 EMA 延迟最低,其次候选顺序
+        # 优先 EMA 延迟最低(已知慢模型降优先级),再按候选顺序;
+        # 在此基础上用轮转指针在健康候选间循环,实现跨模型「自动切」(负载分散,而非永远打第一个)
         healthy.sort(key=lambda m: (self._stat(m)["ema"], cands.index(m)))
-        return healthy[0]
+        pick = healthy[self._rr % len(healthy)]
+        self._rr = (self._rr + 1) % len(healthy)
+        return pick
 
     def report(self, model, latency, error):
         s = self._stat(model)
@@ -1011,14 +1029,16 @@ def main():
     print(f"   compact: mode={SUMMARY_MODE if USE_SUMMARY else 'off'} | thinking={'on' if ENABLE_THINKING else 'off'} | 预算={BUDGET} token")
     if DELEGATE_BACKEND == "siliconflow":
         backend_key, backend_flash, backend_pro, backend_name = SILICONFLOW_API_KEY, SILICONFLOW_FLASH, SILICONFLOW_PRO, "SiliconFlow"
+        backend_src = "local_config.json" if (SILICONFLOW_API_KEY and not os.environ.get("SILICONFLOW_API_KEY", "").strip()) else ("环境变量" if SILICONFLOW_API_KEY else "无")
     else:
         backend_key, backend_flash, backend_pro, backend_name = NVIDIA_API_KEY, NVIDIA_FLASH, NVIDIA_PRO, "NVIDIA"
+        backend_src = _KEY_SOURCE or "无"
     print(f"   工具: delegate(云端subagent/{backend_name}) + assemble(组装+冒烟) + verify | 档位: flash={len(backend_flash)} pro={len(backend_pro)}")
     if not backend_key:
-        print(f"   ⚠ 未检测到 {backend_name} API key —— delegate 将报错,请先设置对应环境变量")
+        print(f"   ⚠ 未检测到 {backend_name} API key —— delegate 将报错,请先设置对应环境变量或写入 local_config.json")
     else:
         masked = backend_key[:10] + "…" + backend_key[-4:]
-        print(f"   🔑 {backend_name} key: {masked}")
+        print(f"   🔑 {backend_name} key: {masked} (来源: {backend_src})")
 
     if args.query:
         q = " ".join(args.query)
