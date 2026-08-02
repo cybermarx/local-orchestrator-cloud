@@ -1,6 +1,6 @@
 # local-orchestrator-cloud
 
-本地 Ollama 35B 编排器 + 云端 NVIDIA subagent + 本地冒烟验证器（去 linker）的「契约优先 / 盲 subagent」agent。
+本地 Ollama 35B 编排器 + 云端 subagent（NVIDIA 或 SiliconFlow 可切换）+ 本地冒烟验证器（去 linker）的「契约优先 / 盲 subagent」agent。
 
 > 这是 **云端 subagent 版本** 的快照。核心思路：本地 35B 只做规划与调度（对话历史只存「指针」，不存大段代码），每个子任务派给云端模型无状态地独立生成，最后由本地确定性验证器组装、校验、并自动修复。**「去 linker」设计**：Python 的 import 系统本身就是连接器（模块=文件=命名空间，同目录放好即连通），因此删除了接线逻辑，只保留「同目录落盘 + 契约感知冒烟 + 按符号归属回灌修复」。
 
@@ -11,9 +11,9 @@
    规划 / 调度。对话历史只放「指针」，永不撑爆上下文。
    带递归摘要压缩 maybe_compact（默认 Qwen3 思考 + 撑爆自动关思考兜底）。
 
-② 云端 subagent（NVIDIA，本仓库版本）
+② 云端 subagent（NVIDIA 或 SiliconFlow，用 `AGENT_DELEGATE_BACKEND` 切换；本仓库默认 NVIDIA）
    把子目标 + 契约 作为一次性 /api/chat 请求发出，拿回 {module, code, provides, depends_on}。
-   每个 subagent 不知道总目标（信息隔离），1M ctx。
+   每个 subagent 不知道总目标（信息隔离），长上下文。
 
 ③ 本地 smoke.py（去 linker）
    确定性「冒烟验证器」：把所有模块文件 + 编排器写的 main.py 落到同一目录
@@ -52,6 +52,9 @@ python ollama_agent.py "写一个带登录的博客系统"
 
 # 需要云端 subagent 时提供 NVIDIA key
 NVIDIA_API_KEY=nvapi-xxx python ollama_agent.py "写一个带登录的博客系统"
+
+# 临时改用 SiliconFlow 作云端后端(key 仅从环境变量读取,不写入本文件)
+SILICONFLOW_API_KEY=sk-xxx AGENT_DELEGATE_BACKEND=siliconflow python ollama_agent.py "写一个带登录的博客系统"
 ```
 
 编排器会：理解总目标 → 设计模块契约 → 逐个 delegate → write_main 写组合根 → assemble 组装并冒烟 →（可选）verify 集成校验。
@@ -75,6 +78,13 @@ NVIDIA_API_KEY=nvapi-xxx python ollama_agent.py "写一个带登录的博客系�
 - `AGENT_429_BACKOFF`：账号级限速退避
 - `AGENT_PROJECT_DIR`：项目输出目录（默认 `./projects`）
 - `AGENT_REPAIR_ROUNDS`：自动修复闭环最大轮次（默认 3）
+
+**SiliconFlow 后端（临时可切换，OpenAI 兼容）**：
+- `AGENT_DELEGATE_BACKEND`：默认 `nvidia`；设 `siliconflow` 即改用 SiliconFlow 作云端 subagent
+- `SILICONFLOW_API_KEY`：临时使用时设置（仅从环境变量读取，不写入本文件 / 不入库）
+- `SILICONFLOW_BASE_URL`：默认 `https://api.siliconflow.cn/v1`
+- `AGENT_SILICONFLOW_FLASH` / `AGENT_SILICONFLOW_PRO`：SiliconFlow 候选模型
+  （默认 flash=DeepSeek-V3 / Qwen3.5-35B-A3B / Qwen3.5-9B，pro=DeepSeek-V3.2 / DeepSeek-R1 / DeepSeek-V3.1-Terminus）
 
 ## 安全说明
 

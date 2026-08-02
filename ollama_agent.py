@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 本地编排器 + 云端 subagent + 本地冒烟验证器(去 linker)
-直连 Ollama(本地35B)作总指挥,唯一能力是把子任务 delegate 给英伟达云端模型,
+直连 Ollama(本地35B)作总指挥,唯一能力是把子任务 delegate 给云端模型(NVIDIA 或 SiliconFlow,可切换),
 最后 assemble 把所有子任务组装成项目。纯标准库 + 本地 smoke.py,零额外依赖。
 
 设计要点(去 linker):Python 的 import 系统本身就是 linker——模块=文件=命名空间,
@@ -12,7 +12,7 @@ smoke.py 做「导入全部模块 + 真正调用 main 入口」的契约感知�
 
 架构三层:
   ① 本地 35B(本脚本):规划/调度,对话历史只放"指针",不存大段代码 → 永不撑爆。
-  ② 云端 subagent(NVIDIA):产模块 + manifest(结构化输出),各自独立、1M ctx。
+  ② 云端 subagent(NVIDIA 或 SiliconFlow,用 AGENT_DELEGATE_BACKEND 切换):产模块 + manifest(结构化输出),各自独立、长上下文。
   ③ 本地 smoke.py:确定性"冒烟验证器",落盘 + 导入/执行校验,零 token。
 
 上下文管理:递归摘要压缩 maybe_compact + 默认 Qwen3 思考 + 撑爆自动关思考兜底(沿用)。
@@ -21,6 +21,7 @@ smoke.py 做「导入全部模块 + 真正调用 main 入口」的契约感知�
   python ollama_agent.py                 # 交互模式(像对话界面一样用)
   python ollama_agent.py "任务"          # 单次任务
   NVIDIA_API_KEY=nvapi-xxx python ollama_agent.py "写一个博客系统"
+  SILICONFLOW_API_KEY=sk-xxx python ollama_agent.py "写一个博客系统"   # 临时用 SiliconFlow 后端
 
 环境变量:
   OLLAMA_URL / AGENT_MODEL / AGENT_NUM_CTX / AGENT_MAX_ITER / AGENT_TEMP / AGENT_THINKING / AGENT_SUMMARIZE / AGENT_SUMMARY_MODE / AGENT_SUMMARIZER_MODEL / AGENT_TRUNCATE_CAP / AGENT_KEEP_RECENT / AGENT_COMPACT_ROUNDS  (沿用原有)
@@ -29,6 +30,11 @@ smoke.py 做「导入全部模块 + 真正调用 main 入口」的契约感知�
   NVIDIA_BASE_URL       默认 https://integrate.api.nvidia.com/v1(也可由 config 的 url 字段回退)
   AGENT_NVIDIA_FLASH    默认 "deepseek-ai/deepseek-v4-flash, z-ai/glm-5.2, minimaxai/minimax-m3, stepfun-ai/step-3.7-flash"
   AGENT_NVIDIA_PRO      默认 "deepseek-ai/deepseek-v4-pro, nvidia/llama-3.1-nemotron-ultra-253b-v1"
+  AGENT_DELEGATE_BACKEND 默认 nvidia;可选 siliconflow(用 SiliconFlow 作云端 subagent 后端)
+  SILICONFLOW_API_KEY   临时用 SiliconFlow 时设置(仅从环境变量读取,不写入本文件 / 不入库)
+  SILICONFLOW_BASE_URL  默认 https://api.siliconflow.cn/v1
+  AGENT_SILICONFLOW_FLASH 默认 "deepseek-ai/DeepSeek-V3, Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-9B"
+  AGENT_SILICONFLOW_PRO   默认 "deepseek-ai/DeepSeek-V3.2, deepseek-ai/DeepSeek-R1, deepseek-ai/DeepSeek-V3.1-Terminus"
   AGENT_DELEGATE_TIMEOUT 默认 120 (秒,单轮内失败会自动切换到下一个候选模型)
   AGENT_LATENCY_WARN    默认 30 (秒,超过记降级)
   AGENT_MODEL_COOLDOWN  默认 60 (秒,熔断冷却)
@@ -135,6 +141,19 @@ LATENCY_WARN = float(os.environ.get("AGENT_LATENCY_WARN", "30"))
 COOLDOWN = float(os.environ.get("AGENT_MODEL_COOLDOWN", "60"))
 MAX_FAILS = int(os.environ.get("AGENT_MODEL_MAX_FAILS", "3"))
 MAX_DELEGATE_TRIES = int(os.environ.get("AGENT_DELEGATE_TRIES", "6"))
+
+# ----------------------------------------------------------------------------
+# SiliconFlow 后端(临时可切换的云端 subagent 后端,OpenAI 兼容 /chat/completions)
+# ----------------------------------------------------------------------------
+DELEGATE_BACKEND = os.environ.get("AGENT_DELEGATE_BACKEND", "nvidia").strip().lower() or "nvidia"
+SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "").strip()
+SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1").rstrip("/")
+SILICONFLOW_FLASH = [x.strip() for x in os.environ.get(
+    "AGENT_SILICONFLOW_FLASH",
+    "deepseek-ai/DeepSeek-V3, Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-9B").split(",") if x.strip()]
+SILICONFLOW_PRO = [x.strip() for x in os.environ.get(
+    "AGENT_SILICONFLOW_PRO",
+    "deepseek-ai/DeepSeek-V3.2, deepseek-ai/DeepSeek-R1, deepseek-ai/DeepSeek-V3.1-Terminus").split(",") if x.strip()]
 BACKOFF = float(os.environ.get("AGENT_429_BACKOFF", "5"))
 PROJECT_DIR = os.environ.get("AGENT_PROJECT_DIR", "./projects")
 REPAIR_ROUNDS = int(os.environ.get("AGENT_REPAIR_ROUNDS", "3"))
@@ -222,6 +241,7 @@ class ModelRouter:
 
 
 ROUTER = ModelRouter(NVIDIA_FLASH, NVIDIA_PRO)
+ROUTER_SF = ModelRouter(SILICONFLOW_FLASH, SILICONFLOW_PRO)
 
 
 SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提供算力的「任务编排器」。
@@ -349,19 +369,19 @@ TOOLS = [
 # ----------------------------------------------------------------------------
 # 云端 subagent 调用(NVIDIA)
 # ----------------------------------------------------------------------------
-def nvidia_chat(model, messages, timeout=DELEGATE_TIMEOUT, use_json=True):
-    if not NVIDIA_API_KEY:
+def _openai_chat(key, base_url, backend_label, model, messages, timeout=DELEGATE_TIMEOUT, use_json=True):
+    """通用 OpenAI 兼容 /chat/completions 调用:NVIDIA 与 SiliconFlow 共用。"""
+    if not key:
         raise RuntimeError(
-            "未找到 NVIDIA API key：请设置 NVIDIA_API_KEY 环境变量，或确保 "
-            "~/.workbuddy/models.json（或 NVIDIA_KEY_CONFIG 指定的文件）中含有 nvapi- 开头的 key"
+            f"未找到 {backend_label} API key：请设置对应的环境变量（NVIDIA_API_KEY 或 SILICONFLOW_API_KEY）"
         )
     payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 4096}
     if use_json:
         payload["response_format"] = {"type": "json_object"}
     data = json.dumps(payload).encode()
-    headers = {"Authorization": f"Bearer {NVIDIA_API_KEY}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
     req = urllib.request.Request(
-        NVIDIA_BASE_URL + "/chat/completions", data=data, headers=headers, method="POST")
+        base_url + "/chat/completions", data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             d = json.load(r)
@@ -374,11 +394,19 @@ def nvidia_chat(model, messages, timeout=DELEGATE_TIMEOUT, use_json=True):
             raise Nvidia429(f"{e.code} 服务过载: {body}")
         if e.code == 400 and use_json:
             # 该模型可能不支持 json_object,重试不带格式
-            return nvidia_chat(model, messages, timeout, use_json=False)
-        raise RuntimeError(f"NVIDIA HTTP {e.code}: {body}")
+            return _openai_chat(key, base_url, backend_label, model, messages, timeout, use_json=False)
+        raise RuntimeError(f"{backend_label} HTTP {e.code}: {body}")
     except urllib.error.URLError as e:
-        raise RuntimeError(f"NVIDIA 连接失败: {e}")
+        raise RuntimeError(f"{backend_label} 连接失败: {e}")
     return d["choices"][0]["message"]["content"]
+
+
+def nvidia_chat(model, messages, timeout=DELEGATE_TIMEOUT, use_json=True):
+    return _openai_chat(NVIDIA_API_KEY, NVIDIA_BASE_URL, "NVIDIA", model, messages, timeout, use_json)
+
+
+def siliconflow_chat(model, messages, timeout=DELEGATE_TIMEOUT, use_json=True):
+    return _openai_chat(SILICONFLOW_API_KEY, SILICONFLOW_BASE_URL, "SiliconFlow", model, messages, timeout, use_json)
 
 
 def parse_subagent_output(text):
@@ -473,6 +501,11 @@ def delegate(task: str, tier: str = "flash", name: str = None,
     repair: 修复模式,传 {"original_task","current_code","error"} 让 subagent 基于现有代码修正(总目标仍不传)。
     replace_id: 指定则原地更新该 SUBTASKS 条目(用于修复),否则追加新条目。
     单轮内若某模型超时/失败会切换到下一个候选,避免反复卡在同一个过载模型上。"""
+    backend = DELEGATE_BACKEND
+    if backend == "siliconflow":
+        router, chat_fn = ROUTER_SF, siliconflow_chat
+    else:
+        router, chat_fn = ROUTER, nvidia_chat
     last_err = "未知错误"
     contract = None
     if provides or depends_on:
@@ -480,7 +513,7 @@ def delegate(task: str, tier: str = "flash", name: str = None,
     tried = set()  # 本轮回避:同一模型本轮不再重试
     label = name or task[:14]
     for _ in range(MAX_DELEGATE_TRIES):
-        model = ROUTER.select(tier, exclude=tried)
+        model = router.select(tier, exclude=tried)
         t0 = time.perf_counter()
         stop = threading.Event()
         wp = threading.Thread(target=_wait_printer, args=(stop, model, label), daemon=True)
@@ -488,10 +521,10 @@ def delegate(task: str, tier: str = "flash", name: str = None,
             print(f"   ⌛ 调用 {model} 生成子任务'{label}'…", flush=True)
             wp.start()
             msgs = subagent_repair_messages(repair, contract) if repair else subagent_messages(task, contract)
-            content = nvidia_chat(model, msgs, timeout=DELEGATE_TIMEOUT)
+            content = chat_fn(model, msgs, timeout=DELEGATE_TIMEOUT)
             latency = time.perf_counter() - t0
             stop.set(); wp.join(timeout=1)
-            ROUTER.report(model, latency, None)
+            router.report(model, latency, None)
             manifest = parse_subagent_output(content)
             if replace_id is not None:
                 for st in SUBTASKS:
@@ -530,7 +563,7 @@ def delegate(task: str, tier: str = "flash", name: str = None,
         except Exception as e:
             stop.set(); wp.join(timeout=1)
             latency = time.perf_counter() - t0
-            ROUTER.report(model, latency, True)
+            router.report(model, latency, True)
             tried.add(model)  # 本轮内不再重试同一模型,切换到下一个候选
             last_err = f"{type(e).__name__}: {e}"
             continue
@@ -976,13 +1009,16 @@ def main():
 
     print(f"🦙 本地编排器 | 模型={MODEL} | num_ctx={NUM_CTX} | Ollama={OLLAMA_URL}")
     print(f"   compact: mode={SUMMARY_MODE if USE_SUMMARY else 'off'} | thinking={'on' if ENABLE_THINKING else 'off'} | 预算={BUDGET} token")
-    print(f"   工具: delegate(云端subagent) + assemble(组装+冒烟) + verify(集成校验+自动修复) | NVIDIA档: flash={len(NVIDIA_FLASH)} pro={len(NVIDIA_PRO)}")
-    if not NVIDIA_API_KEY:
-        print("   ⚠ 未检测到 NVIDIA_API_KEY —— delegate 将报错,请先 export NVIDIA_API_KEY=nvapi-... 或在 config 中配置")
+    if DELEGATE_BACKEND == "siliconflow":
+        backend_key, backend_flash, backend_pro, backend_name = SILICONFLOW_API_KEY, SILICONFLOW_FLASH, SILICONFLOW_PRO, "SiliconFlow"
     else:
-        masked = NVIDIA_API_KEY[:10] + "…" + NVIDIA_API_KEY[-4:]
-        src = _KEY_SOURCE or "环境变量"
-        print(f"   🔑 NVIDIA key: {masked} (来源: {src})")
+        backend_key, backend_flash, backend_pro, backend_name = NVIDIA_API_KEY, NVIDIA_FLASH, NVIDIA_PRO, "NVIDIA"
+    print(f"   工具: delegate(云端subagent/{backend_name}) + assemble(组装+冒烟) + verify | 档位: flash={len(backend_flash)} pro={len(backend_pro)}")
+    if not backend_key:
+        print(f"   ⚠ 未检测到 {backend_name} API key —— delegate 将报错,请先设置对应环境变量")
+    else:
+        masked = backend_key[:10] + "…" + backend_key[-4:]
+        print(f"   🔑 {backend_name} key: {masked}")
 
     if args.query:
         q = " ".join(args.query)
