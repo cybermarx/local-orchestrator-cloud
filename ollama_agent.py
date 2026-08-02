@@ -55,6 +55,7 @@ import subprocess
 import urllib.request
 import urllib.error
 import argparse
+import shutil
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -254,6 +255,7 @@ BUDGET = int(NUM_CTX * 0.8)
 # ----------------------------------------------------------------------------
 SUBTASKS = []  # [{"id","manifest":{...},"model","latency"}]
 MAIN_CODE = ""  # 编排器写的主函数(组合根),由 write_main 工具暂存,assemble 时一并落盘
+_CURRENT_PROJECT = ""  # 当前项目名(由 write_main/assemble 设置,供子编排器归位子系统目录)
 MAIN_SUBTASK_ID = "__MAIN__"  # 组合根 main.py 在 SUBTASKS 中的特殊条目 id(可修复路由用)
 
 
@@ -356,6 +358,7 @@ SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
 
 你有这些工具:
 - delegate(task, tier?, name?, provides?, depends_on?): 把一个子任务的**子目标**派给云端 subagent 完成。返回简短指针——真实成果存入「侧边存储」,不占对话上下文。
+- delegate_subsystem(task, subdir, name?, provides?, depends_on?, project_name?): **无损 scope 分解**——把一簇**内聚的模块**打包成一个「子系统」,派给一个**子编排器**递归 delegate+assemble 构建。子编排器只把『对外薄契约』(provides 符号)返回给你,你这边只占 1 个节点,**内部模块不进你的上下文**,从而避免契约列表膨胀、上下文爆。当你要设计的模块太多(契约列表装不下)、或你正基于一大坨**已有代码**改进(已有代码已被载入侧边存储)而改动面很大时,用本工具:把内聚的一簇任务/已有模块归成一个子系统。你后续用 `from subdir import <符号>` 调用它。
 - write_main(project_name, main_code): 你(编排器,掌握总目标)亲自写**主函数 main.py(组合根)**。它 import 各模块、按你设计的契约调用它们,把整个项目串起来。main.py 必须严格按 provides/depends_on 约定的**名字与签名**调用各模块符号——这是「去 linker」设计下唯一需要你保证接口一致的地方(同目录放文件即可,import 会自行接线)。这里只暂存代码,落盘由 assemble 统一做。
 - assemble(project_name): 所有模块 delegate 完成、且你已 write_main 后调用。它把所有模块文件 + main.py 落到同一目录(无需接线,Python import 即 linker),然后做「导入全部模块 + 真正调用 main 入口」的契约感知冒烟;对冒烟失败(符号名/签名漂移、缺失模块、循环依赖)自动启动修复闭环,返回项目树。
 - verify(project_name, test_code, name?): 【可选】assemble 后,用一个**短**Python 片段对生成的项目做**一片**集成校验(你掌握总目标,应写出能验证核心流程的断言,如 register 后 login 能拿到 token)。失败会自动回灌 subagent 修复并重新组装。**校验要分片**:一次只验一个切面,分多次调用,用 name 标注这片验什么。**防作弊硬约束**:你写的断言必须是**真实校验**(如 `assert "token" in output`、`assert user.id == 1`),**严禁**在 verify 失败后把断言改弱来强行变绿(如 `assert len(output)>10 or "Error" not in output`、`assert True`、只用 `len(x)>0` 验存在性不验内容);同一 name 重复 verify 应修正测试逻辑或修复项目,而不是放宽断言。
@@ -367,7 +370,7 @@ SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
    - provides: 它必须对外暴露的符号列表(函数/类名,尽量带签名,如 "get_user(id) -> User")
    - depends_on: 它**实际会调用**的其它模块符号——**既要列读依赖,也要列写依赖**(例如注册模块既要依赖 "user_db:authenticate" 也要依赖 "user_db:create_user",因为注册必须把用户写进库)。格式 "模块:符号(签名)"。
    契约是 subagent 之间对接的**唯一依据**,务必让 provides 与 depends_on 互相吻合(谁提供、谁消费要一致;尤其注意写流程的两端都要连上)。
-3. 逐个 delegate:每次只把**该模块的「子目标」+「契约」**(必提供的符号/签名、可依赖的符号/签名)传给 subagent。**绝不要把总目标写进 subagent 的提示**——subagent 只该看到自己的子目标与契约。
+3. 逐个 delegate:每次只把**该模块的「子目标」+「契约」**(必提供的符号/签名、可依赖的符号/签名)传给 subagent。**绝不要把总目标写进 subagent 的提示**——subagent 只该看到自己的子目标与契约。若你规划的模块太多、契约列表开始撑爆上下文,或你正基于**已有代码**做大面改进:把内聚的一簇任务/已有模块归成一个子系统,改用 **delegate_subsystem**(子编排器只把薄契约返回给你,内部模块不进你的上下文)。
 4. 你亲自写 main.py:基于上面设计的契约,import 各模块、按约定名字/签名调用它们,串成完整流程。用 write_main 暂存(务必让 import 名与 provides 完全一致)。
 5. 调用 assemble 组装(会自动冒烟与修复);若任务有明显 happy-path,再**分多次**调用 verify,每次跑一小片集成断言,让系统把逻辑错误也自动修掉。若 assemble/verify 报告「缺失模块 X」或「No module named X」,说明 X 从未被 delegate——你必须在下一轮用 delegate 创建 X 模块(给出子目标与契约),然后再次 assemble,直到不再有缺失模块。
 6. 简单聊天可直接回答,不必 delegate。
@@ -461,6 +464,217 @@ for _ph, _v in (("%MAXMOD%", MAX_MODULE_LINES), ("%MAXMAIN%", MAX_MAIN_LINES),
 
 
 # ----------------------------------------------------------------------------
+# 分层子编排器(无损 scope 分解 / hierarchical sub-orchestrator)
+# ----------------------------------------------------------------------------
+# 背景:当项目 scope 太大(顶层契约列表都装不下)时,串行递归的单个编排器会被
+# 「契约列表膨胀」拖爆上下文。解法:把一个内聚子系统委派给【子编排器】,子编排器在
+# 独立上下文里递归 delegate+assemble,只把「对外薄契约」(provides 符号)返回给父。
+# 父的 SUBTASKS 里该子系统只占 1 个节点(内部模块不进父上下文),契约列表不膨胀。
+# 与「递归压缩」互补:压缩是有损兜底,分层委派是无损结构分解,scope 爆优先用它。
+MAX_ORCH_DEPTH = int(os.environ.get("AGENT_MAX_ORCH_DEPTH", "2"))
+
+# 进入子编排器时,把 SUBTASKS/MAIN_CODE/SYSTEM_PROMPT 临时换成子树私有实例(用栈支持嵌套),
+# 子编排器跑的就是同一套 delegate/assemble/verify 工具;退出时还原。
+_ORCH_STACK = []
+
+
+def _push_orch_ctx(sys_prompt: str):
+    global SUBTASKS, MAIN_CODE, SYSTEM_PROMPT
+    _ORCH_STACK.append((SUBTASKS, MAIN_CODE, SYSTEM_PROMPT))
+    SUBTASKS = []
+    MAIN_CODE = ""
+    SYSTEM_PROMPT = sys_prompt
+
+
+def _pop_orch_ctx():
+    global SUBTASKS, MAIN_CODE, SYSTEM_PROMPT
+    SUBTASKS, MAIN_CODE, SYSTEM_PROMPT = _ORCH_STACK.pop()
+
+
+def _orch_depth() -> int:
+    """当前嵌套深度 = 已压栈的父上下文数。顶层(未进任何子编排器)为 0。"""
+    return len(_ORCH_STACK)
+
+
+SUBSYS_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提供算力的「子系统编排器」。
+你【不】是顶层编排器,而是受父编排器委派、只负责构建【一个内聚子系统】的子编排器。
+职责边界:
+1. 你只交付一个内聚子系统,对外只暴露父编排器指定的【薄契约】(provides 符号)。
+2. 把子系统拆成若干小模块,逐个 delegate(每个 ≤%MAXMOD% 行);逻辑下沉成模块,不要堆在 main。
+3. 子系统内部模块全部落在子目录 {SUBDIR}/ 里:你【必须】用 assemble 组装到子目录 "{SUBDIR}",
+   main.py 只在子系统内部做 import + 编排(若子系统只需被父调用,main.py 可最小化)。
+4. 内部模块之间用相对导入:`from .其他模块 import 符号`;不要用 `from 其他模块`(无点)。
+5. 你【必须】确保父要求的 provides 符号在子系统中真实存在,且能被
+   `from {SUBDIR} import <符号>` 导入(即该符号是某内部模块的顶层 def/class)。
+6. 每次只做一步(一次工具调用),不要一口气规划完——和顶层编排器一样的串行节奏。
+7. assemble 通过后直接结束(返回一句简短总结),不要写多余解释。
+8. 你【禁止】再调用 delegate_subsystem(你已是子树底层,再开子编排器会无限嵌套);
+   若某模块仍太大,用普通 delegate,它会自行递归拆分。
+"""
+
+
+def sub_orchestrate(task: str, name: str, provides: list, depends_on: list,
+                    subdir: str, parent_project: str, depth: int) -> str:
+    """运行一个子编排器构建子系统,把成果落到磁盘并在父上下文登记一个薄契约节点。"""
+    # 深度到顶:退化为普通 delegate(在父上下文直接建一个模块,不再分层)。
+    if depth >= MAX_ORCH_DEPTH:
+        return delegate(task, name=name, provides=provides, depends_on=depends_on, _depth=depth)
+    sys_prompt = SUBSYS_PROMPT.replace("{SUBDIR}", subdir)
+    _push_orch_ctx(sys_prompt)
+    n_mods = 0
+    try:
+        query = (
+            f"构建子系统「{name or task[:14]}」,目标是:{task}\n"
+            f"父编排器要求你对外暴露的薄契约(provides)符号为:"
+            f" {provides or '（由你自行决定,但务必内聚且可被父调用）'}\n"
+            f"请把它拆成小模块逐个 delegate,最后 assemble 到子目录 '{subdir}',"
+            f"并确保这些 provides 符号能被 `from {subdir} import ...` 导入。"
+        )
+        print(f"\n📡 进入子编排器构建子系统 '{name or task[:14]}'"
+              f" (subdir={subdir}, 深度 {depth + 1}/{MAX_ORCH_DEPTH})", flush=True)
+        run_agent(query)  # 子编排器在独立上下文里跑,只看到自己的子树
+        n_mods = len([s for s in SUBTASKS
+                      if s.get("manifest", {}).get("module") not in ("main.py", "__init__.py")])
+    finally:
+        _pop_orch_ctx()  # 还原父上下文(必须在读 SUBTASKS 之前)
+
+    # 把子系统成果从 PROJECT_DIR/{subdir} 归位到 PROJECT_DIR/{parent_project}/{subdir}
+    built = os.path.join(PROJECT_DIR, subdir)
+    target_rel = os.path.join(parent_project, subdir) if parent_project else subdir
+    target = os.path.join(PROJECT_DIR, target_rel)
+    if os.path.isdir(built) and built != target:
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+        shutil.move(built, target)
+    # 子编排器的内部 SUBTASKS 已在 _pop 时丢弃,这里扫描落盘目录重建内部模块清单以生成桥
+    init_code = _build_subpkg_init_from_dir(target, provides)
+    try:
+        with open(os.path.join(target, "__init__.py"), "w", encoding="utf-8") as f:
+            f.write(init_code)
+    except Exception as e:
+        return f"[{name}] 子编排器已构建但写 __init__.py 失败: {e}"
+
+    sid = len(SUBTASKS) + 1
+    SUBTASKS.append({
+        "id": sid,
+        "name": name,
+        "is_subsystem": True,
+        "subdir": target_rel,
+        "task": task,
+        "manifest": {
+            "module": f"{target_rel}/__init__.py",
+            "provides": provides or [],
+            "code": init_code,  # re-export 桥,使契约校验不误报
+        },
+        "contract": {"provides": provides or [], "depends_on": depends_on or []},
+        "model": "sub-orchestrator",
+        "tier": "flash",
+        "latency": 0.0,
+    })
+    tag = f"[{name}] " if name else ""
+    return (f"{tag}子系统#{sid} 构建完成(子编排器) | subdir={target_rel} | "
+            f"薄契约 provides={provides} | 内部 {n_mods} 个模块不进父上下文")
+
+
+def _build_subpkg_init_from_dir(subdir_path: str, provides: list) -> str:
+    """扫描子系统目录里的 .py 文件,重建内部模块 -> 顶层符号映射,生成 __init__.py 桥。"""
+    mod_syms = {}
+    if os.path.isdir(subdir_path):
+        for fn in sorted(os.listdir(subdir_path)):
+            if not fn.endswith(".py") or fn == "main.py" or fn == "__init__.py":
+                continue
+            try:
+                with open(os.path.join(subdir_path, fn), encoding="utf-8") as f:
+                    code = f.read()
+            except Exception:
+                continue
+            mod_syms[fn[:-3]] = _defined_top_names(code)
+    lines = ["# 自动生成的薄契约桥:仅 re-export 父编排器需要的符号,隐藏子系统内部实现。",
+             "from __future__ import annotations", ""]
+    missing = []
+    for p in provides:
+        sym = p.split("(")[0].split("->")[0].strip()
+        if not sym:
+            continue
+        host = next((b for b, syms in mod_syms.items() if sym in syms), None)
+        if host:
+            lines.append(f"from .{host} import {sym}")
+        else:
+            missing.append(sym)
+    lines.append("")
+    if missing:
+        lines.append("# 以下薄契约符号在子系统内部未找到定义(子系统未兑现);"
+                     " 父 assemble / 契约校验会暴露此问题:")
+        for sym in missing:
+            lines.append(f"#   {sym}")
+    return "\n".join(lines)
+
+
+def delegate_subsystem(task: str, subdir: str, name: str = None,
+                       provides: list = None, depends_on: list = None,
+                       project_name: str = None) -> str:
+    """把一个【子系统】(一簇内聚模块的合集)派给子编排器构建(无损 scope 分解)。
+    当某簇任务体量很大,或你基于一大坨【已有代码】做改进而顶层契约列表装不下时,用本工具:
+    把内聚的一簇任务打包成一个子系统,委派给子编排器递归 delegate+assemble;
+    子编排器只把『对外薄契约』(provides 符号)返回给你,你这边只占 1 个节点,契约列表不膨胀。
+    子编排器会把模块落到 {project}/{subdir}/ 并生成 __init__.py 桥;你后续用
+    `from subdir import <符号>` 或 `import subdir` 调用它。
+    project_name 须与后续 write_main/assemble 用的项目名一致(默认取当前项目或 'project')。"""
+    depth = _orch_depth()
+    if depth >= MAX_ORCH_DEPTH:
+        return delegate(task, name=name, provides=provides, depends_on=depends_on)
+    parent = project_name or _CURRENT_PROJECT or "project"
+    return sub_orchestrate(task, name, provides or [], depends_on or [],
+                           subdir, parent, depth)
+
+
+def _seed_existing_code(path: str) -> int:
+    """「基于已有代码改进」入口:扫描 PATH 下的顶层 .py 模块,作为 is_existing 节点载入侧边存储。
+    编排器随后可在【保留核心职责与对外接口】的前提下 delegate(repair=...) 改进它们,
+    或在改动面很大时用 delegate_subsystem 把一簇已有模块归成子系统(避免契约列表膨胀)。
+    只扫顶层 .py(不递归),跳过 main.py/__init__.py;非破坏式——原代码不动,改进产物写到新项目目录。
+    返回载入模块数。"""
+    global _CURRENT_PROJECT
+    p = os.path.abspath(path)
+    if not os.path.isdir(p):
+        print(f"   ⚠ --improve 路径不存在: {path}")
+        return 0
+    _CURRENT_PROJECT = os.path.basename(p.rstrip(os.sep)) or "project"
+    count = 0
+    for fn in sorted(os.listdir(p)):
+        if not fn.endswith(".py") or fn in ("main.py", "__init__.py"):
+            continue
+        full = os.path.join(p, fn)
+        if not os.path.isfile(full):
+            continue
+        try:
+            with open(full, encoding="utf-8") as f:
+                code = f.read()
+        except Exception as e:
+            print(f"   ⚠ 读 {fn} 失败: {e}")
+            continue
+        if not code.strip():
+            continue
+        provides = sorted(_defined_top_names(code))
+        sid = len(SUBTASKS) + 1
+        SUBTASKS.append({
+            "id": sid,
+            "name": fn[:-3],
+            "is_existing": True,
+            "task": f"已有模块 {fn}(基于已有代码改进,保留核心职责与对外接口)",
+            "manifest": {"module": fn, "code": code,
+                         "provides": provides, "depends_on": []},
+            "contract": None,
+            "model": "existing",
+            "tier": "flash",
+            "latency": 0.0,
+        })
+        count += 1
+        print(f"   📦 载入已有模块: {fn} | provides={provides}")
+    return count
+
+
+# ----------------------------------------------------------------------------
 # 工具 schema(精简,控制总 token 数)
 # ----------------------------------------------------------------------------
 TOOLS = [
@@ -479,6 +693,25 @@ TOOLS = [
                     "depends_on": {"type": "array", "items": {"type": "string"}, "description": "本模块可依赖的其它模块符号契约,格式 '模块:符号(签名)'。subagent 只允许调用这些外部符号。"},
                 },
                 "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_subsystem",
+            "description": "把一个【子系统】(一簇内聚模块的合集)派给子编排器构建——无损 scope 分解。当某簇任务体量很大,或你基于一大坨【已有代码】做改进而顶层契约列表装不下时,用本工具:把内聚的一簇任务打包成一个子系统,委派给子编排器递归 delegate+assemble;子编排器只把『对外薄契约』(provides 符号)返回给你,你这边只占 1 个节点,契约列表不膨胀。子编排器会把模块落到 {project}/{subdir}/ 并生成 __init__.py 桥;你后续用 `from subdir import <符号>` 或 `import subdir` 调用它。project_name 须与后续 write_main/assemble 用的项目名一致(默认取当前项目或 'project')。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "该子系统的「子目标」:清晰、自包含,描述这一簇模块合起来要做什么(不要写入总目标)。"},
+                    "subdir": {"type": "string", "description": "子系统落盘子目录名(如 'ingest_pipeline'),须是合法 Python 包名(小写、下划线),不要带斜杠或 .py"},
+                    "name": {"type": "string", "description": "可选的子系统工程名/编号,便于后续引用"},
+                    "provides": {"type": "array", "items": {"type": "string"}, "description": "该子系统须对外暴露的薄契约符号,如 ['build_index(docs) -> Index'];子编排器须确保这些符号可被父 `from subdir import` 调用。父只看到这些,内部模块不进父上下文。"},
+                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "该子系统可依赖的其它(父级)模块符号契约,格式 '模块:符号(签名)'。"},
+                    "project_name": {"type": "string", "description": "项目目录名(须与后续 write_main/assemble 一致);默认取当前项目或 'project'"},
+                },
+                "required": ["task", "subdir"],
             },
         },
     },
@@ -1165,8 +1398,9 @@ def _get_main_code():
 def write_main(project_name: str, main_code: str) -> str:
     """编排器(掌握总目标)亲自写组合根 main.py,注册为 SUBTASKS 中的 MAIN 条目(可修复路由),
     assemble 时一并落盘。"""
-    global MAIN_CODE
+    global MAIN_CODE, _CURRENT_PROJECT
     MAIN_CODE = main_code or ""
+    _CURRENT_PROJECT = project_name or _CURRENT_PROJECT
     if not MAIN_CODE.strip():
         return "[write_main] 收到空代码,未暂存。请传入完整的 main.py 源码。"
     # 注册/更新 MAIN 条目(供自动修复闭环路由:组合根 import 错误可被重写)
@@ -1244,6 +1478,15 @@ def _check_contracts(subtasks, main_code):
         mod = m.get("module") or ""
         if mod == "main.py":
             continue
+        if st.get("is_subsystem"):  # 子系统:以包名注册,薄契约符号视为已定义(re-export 桥提供)
+            sub = st.get("subdir") or ""
+            base = sub.split("/")[-1] or sub
+            mod_basenames[base] = mod
+            prov = {p.split("(")[0].split("->")[0].strip()
+                    for p in (m.get("provides") or [])}
+            mod_symbols[mod] = prov
+            provided[mod] = prov
+            continue
         base = mod[:-3] if mod.endswith(".py") else mod
         mod_basenames[base] = mod
         mod_symbols[mod] = _defined_top_names(m.get("code", "") or "")
@@ -1263,7 +1506,7 @@ def _check_contracts(subtasks, main_code):
     for st in subtasks:                      # ② + ③ depends_on 解析
         m = st.get("manifest", {}) or {}
         mod = m.get("module") or ""
-        if mod == "main.py":
+        if mod == "main.py" or st.get("is_subsystem"):
             continue
         for dep in (m.get("depends_on") or []):
             dmod, dsym = _parse_dep(dep)
@@ -1322,14 +1565,22 @@ def _check_contracts(subtasks, main_code):
 
 
 def assemble(project_name: str) -> str:
-    biz_subtasks = [st for st in SUBTASKS if st.get("manifest", {}).get("module") != "main.py"]
+    global _CURRENT_PROJECT
+    _CURRENT_PROJECT = project_name or _CURRENT_PROJECT
+    # 子系统节点已在磁盘上(子编排器构建时落盘 + 归位),不进扁平写;只写普通业务模块
+    biz_subtasks = [st for st in SUBTASKS
+                    if not st.get("is_subsystem")
+                    and st.get("manifest", {}).get("module") != "main.py"]
     if not biz_subtasks:
         return "[assemble] 侧边存储中没有业务子任务,请先 delegate 若干子任务(并 write_main 组合根)。"
     out_dir = os.path.join(PROJECT_DIR, project_name or "project")
+    # 子系统子目录是本地包,需从 requirements.txt 聚合里排除(否则被误判为第三方依赖)
+    local_pkgs = [st.get("subdir", "").split("/")[0]
+                  for st in SUBTASKS if st.get("is_subsystem") and st.get("subdir")]
     try:
         # main.py 由 _get_main_code 单独落盘;业务模块排除 main.py 条目,避免双重写
         main_code = _get_main_code()
-        written = smoke.assemble(out_dir, biz_subtasks, main_code)
+        written = smoke.assemble(out_dir, biz_subtasks, main_code, local_pkgs=local_pkgs)
         ok, failures = smoke.smoke_project(out_dir)
         lines = [smoke.format_report(out_dir, written, ok, failures)]
         if not ok:
@@ -1651,6 +1902,7 @@ def verify(project_name: str, test_code: str, name: str = None) -> str:
 
 DISPATCH = {
     "delegate": delegate,
+    "delegate_subsystem": delegate_subsystem,
     "write_main": write_main,
     "assemble": assemble,
     "verify": verify,
@@ -1985,9 +2237,20 @@ def main():
     parser.add_argument("query", nargs="*", help="单次任务（不填则进入交互模式）")
     parser.add_argument("--local", action="store_true",
                         help="全本地模式:subagent 也用本地 Ollama(串行递归),完全不联网")
+    parser.add_argument("--improve", metavar="PATH",
+                        help="基于已有代码改进:扫描 PATH 下的 .py 载入侧边存储,再执行改进任务(query)")
     args = parser.parse_args()
     if args.local:
         DELEGATE_BACKEND = "ollama"
+
+    # --improve:把已有代码载入侧边存储,并把「在此基础改进」的指引前置到任务里
+    if args.improve:
+        n = _seed_existing_code(args.improve)
+        if n:
+            note = (f"[已有代码已载入侧边存储,共 {n} 个模块。请在保留这些模块核心职责与"
+                    f"对外接口的前提下做如下改进: ")
+            args.query = [note] + list(args.query)
+            print(f"   📥 已载入已有代码 {n} 个模块,将在此基础上改进(项目名={_CURRENT_PROJECT})")
 
     print(f"🦙 本地编排器 | 模型={MODEL} | num_ctx={NUM_CTX} | Ollama={OLLAMA_URL}")
     print(f"   compact: mode={SUMMARY_MODE if USE_SUMMARY else 'off'} | thinking={'on' if ENABLE_THINKING else 'off'} | 预算={BUDGET} token")

@@ -31,13 +31,14 @@ def list_modules(out_dir):
             if fn.endswith(".py") and fn != "main.py" and fn != "test_smoke.py"]
 
 
-def assemble(out_dir, subtasks, main_code):
+def assemble(out_dir, subtasks, main_code, local_pkgs=None):
     """把所有 subagent 交付的模块文件 + 编排器写的 main.py 落到同一目录(扁平,不接线)。
-    subtasks: [{"manifest": {module, code, provides, depends_on}, ...}]。返回写入的文件列表。"""
+    subtasks: [{"manifest": {module, code, provides, depends_on}, ...}]。返回写入的文件列表。
+    local_pkgs: 额外已知的本地包目录名(如分层子编排器产生的子系统子目录),从第三方依赖聚合里排除。"""
     out_dir = os.path.abspath(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     written = []
-    local_mods = set()
+    local_mods = set(local_pkgs or set())
     codes = []
     for st in subtasks:
         m = st.get("manifest", {})
