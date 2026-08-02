@@ -628,16 +628,48 @@ def delegate_subsystem(task: str, subdir: str, name: str = None,
                            subdir, parent, depth)
 
 
+def _seed_one_file(full: str, fn: str) -> bool:
+    """载入单个已有 .py 文件为 is_existing 节点。成功返回 True。"""
+    try:
+        with open(full, encoding="utf-8") as f:
+            code = f.read()
+    except Exception as e:
+        print(f"   ⚠ 读 {fn} 失败: {e}")
+        return False
+    if not code.strip():
+        return False
+    provides = sorted(_defined_top_names(code))
+    sid = len(SUBTASKS) + 1
+    SUBTASKS.append({
+        "id": sid,
+        "name": fn[:-3],
+        "is_existing": True,
+        "task": f"已有模块 {fn}(基于已有代码改进,保留核心职责与对外接口)",
+        "manifest": {"module": fn, "code": code,
+                     "provides": provides, "depends_on": []},
+        "contract": None,
+        "model": "existing",
+        "tier": "flash",
+        "latency": 0.0,
+    })
+    print(f"   📦 载入已有模块: {fn} | provides={provides}")
+    return True
+
+
 def _seed_existing_code(path: str) -> int:
-    """「基于已有代码改进」入口:扫描 PATH 下的顶层 .py 模块,作为 is_existing 节点载入侧边存储。
-    编排器随后可在【保留核心职责与对外接口】的前提下 delegate(repair=...) 改进它们,
-    或在改动面很大时用 delegate_subsystem 把一簇已有模块归成子系统(避免契约列表膨胀)。
-    只扫顶层 .py(不递归),跳过 main.py/__init__.py;非破坏式——原代码不动,改进产物写到新项目目录。
+    """「基于已有代码改进」入口:PATH 支持两种形态——
+    · 单文件 .py:只载入这一个有代码文件(最常用的「改进这一份」);
+    · 目录:扫描其顶层 .py(不递归),跳过 main.py/__init__.py。
+    载入的模块作为 is_existing 节点入侧边存储,编排器可在【保留核心职责与对外接口】前提下
+    delegate(repair=...) 改进,或改动面大时用 delegate_subsystem 归成子系统。非破坏式——原代码不动。
     返回载入模块数。"""
     global _CURRENT_PROJECT
     p = os.path.abspath(path)
+    if os.path.isfile(p) and p.endswith(".py"):
+        _CURRENT_PROJECT = os.path.basename(os.path.dirname(p).rstrip(os.sep)) or "project"
+        return 1 if _seed_one_file(p, os.path.basename(p)) else 0
     if not os.path.isdir(p):
-        print(f"   ⚠ --improve 路径不存在: {path}")
+        print(f"   ⚠ --improve 路径不存在或不是 .py 文件/目录: {path}")
         return 0
     _CURRENT_PROJECT = os.path.basename(p.rstrip(os.sep)) or "project"
     count = 0
@@ -647,30 +679,8 @@ def _seed_existing_code(path: str) -> int:
         full = os.path.join(p, fn)
         if not os.path.isfile(full):
             continue
-        try:
-            with open(full, encoding="utf-8") as f:
-                code = f.read()
-        except Exception as e:
-            print(f"   ⚠ 读 {fn} 失败: {e}")
-            continue
-        if not code.strip():
-            continue
-        provides = sorted(_defined_top_names(code))
-        sid = len(SUBTASKS) + 1
-        SUBTASKS.append({
-            "id": sid,
-            "name": fn[:-3],
-            "is_existing": True,
-            "task": f"已有模块 {fn}(基于已有代码改进,保留核心职责与对外接口)",
-            "manifest": {"module": fn, "code": code,
-                         "provides": provides, "depends_on": []},
-            "contract": None,
-            "model": "existing",
-            "tier": "flash",
-            "latency": 0.0,
-        })
-        count += 1
-        print(f"   📦 载入已有模块: {fn} | provides={provides}")
+        if _seed_one_file(full, fn):
+            count += 1
     return count
 
 
@@ -2238,7 +2248,8 @@ def main():
     parser.add_argument("--local", action="store_true",
                         help="全本地模式:subagent 也用本地 Ollama(串行递归),完全不联网")
     parser.add_argument("--improve", metavar="PATH",
-                        help="基于已有代码改进:扫描 PATH 下的 .py 载入侧边存储,再执行改进任务(query)")
+                        help="基于已有代码改进:PATH 可以是单个 .py 文件(改进这一份),"
+                             "或目录(扫描其顶层 .py 载入侧边存储);随后执行改进任务(query)")
     args = parser.parse_args()
     if args.local:
         DELEGATE_BACKEND = "ollama"
