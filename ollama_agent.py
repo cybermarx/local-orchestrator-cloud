@@ -95,6 +95,10 @@ SUB_CTX_MAX = int(os.environ.get("AGENT_SUB_CTX_MAX", "24576"))
 # 影子模块守卫:subagent/编排器若把模块命名成与 stdlib 或已安装第三方库同名(如 requests.py),
 # 本地文件会遮蔽真库,且生成代码常 import 同名库 → 自引用递归。默认开启,delegate 时告警。
 GUARD_STDLIB_SHADOW = os.environ.get("AGENT_GUARD_SHADOW", "1").lower() in ("1", "true", "yes", "on")
+# 运行时契约校验:assemble 时对「模块是否真定义其 provides 符号 / depends_on 目标是否存在 /
+# main 是否接线各模块」做静态 AST 检查,暴露符号级契约漂移(孤儿/改名/影子/未接线)。
+# 默认开启;数据形状错配(如 main 平铺 dict 而消费方读嵌套)属运行时行为,需 verify 真实断言暴露。
+CONTRACT_CHECK = os.environ.get("AGENT_CONTRACT_CHECK", "1").lower() in ("1", "true", "yes", "on")
 
 # --- 粒度硬约束(低比特量化下,缩短单次输出是保证完整性的主要手段) -----------
 MAX_MODULE_LINES = int(os.environ.get("AGENT_MAX_MODULE_LINES", "60"))
@@ -497,7 +501,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "assemble",
-            "description": "把所有已完成的子任务(侧边存储中)与 write_main 暂存的 main.py 组装成一个项目:落到同一目录(Python import 即 linker,不做接线)、做语法校验,并自动做「导入全部模块 + 调用 main 入口」的契约感知冒烟——冒烟失败(符号名/签名漂移、缺失模块、循环依赖)会启动自动修复闭环(回灌云端 subagent 修复后重新组装)。用于「写一个大项目」类任务收尾。",
+            "description": "把所有已完成的子任务(侧边存储中)与 write_main 暂存的 main.py 组装成一个项目:落到同一目录(Python import 即 linker,不做接线)、做语法校验,并自动做「导入全部模块 + 调用 main 入口」的契约感知冒烟——冒烟失败(符号名/签名漂移、缺失模块、循环依赖)会启动自动修复闭环(回灌云端 subagent 修复后重新组装)。组装后还会做符号级契约校验(模块是否真定义其 provides 符号、main 是否接线各模块),如有漂移会在返回里列出,可用 delegate 修复或 verify 暴露数据形状错配。用于「写一个大项目」类任务收尾。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1202,6 +1206,121 @@ def write_main(project_name: str, main_code: str) -> str:
             "组装失败时组合根可被自动重写修复。")
 
 
+def _defined_top_names(code: str) -> set:
+    """模块顶层定义的 def/class/async def/赋值名字集合(契约校验用)。"""
+    names = set()
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return names
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+    return names
+
+
+def _parse_dep(dep: str):
+    """'module:symbol(args)->ret' -> (module, symbol)。无冒号则 (None, 原文)。"""
+    if ":" not in (dep or ""):
+        return (None, (dep or "").strip())
+    mod, sym = dep.split(":", 1)
+    return (mod.strip(), sym.strip())
+
+
+def _check_contracts(subtasks, main_code):
+    """静态契约校验(无 LLM,纯 AST):返回问题文本列表。
+    覆盖:① 模块未定义其 provides 符号(孤儿/改名/影子遮蔽);② depends_on 目标符号在目标模块不存在;
+    ③ 依赖的模块从未被 delegate(缺失模块);④ main.py 未 import 某已交付模块;
+    ⑤ main 调用了未由任何模块提供的符号(契约未兑现/名字拼错)。
+    注:模块间『数据形状』错配(如 main 平铺 dict 而消费方读嵌套)属运行时行为,需 verify 真实断言暴露。"""
+    issues = []
+    mod_symbols, mod_basenames, provided = {}, {}, {}
+    for st in subtasks:
+        m = st.get("manifest", {}) or {}
+        mod = m.get("module") or ""
+        if mod == "main.py":
+            continue
+        base = mod[:-3] if mod.endswith(".py") else mod
+        mod_basenames[base] = mod
+        mod_symbols[mod] = _defined_top_names(m.get("code", "") or "")
+    for st in subtasks:
+        m = st.get("manifest", {}) or {}
+        mod = m.get("module") or ""
+        if mod == "main.py":
+            continue
+        prov = set()
+        for p in (m.get("provides") or []):
+            prov.add(p.split("(")[0].split("->")[0].strip())
+        provided[mod] = prov
+        for sym in prov:                      # ① provides 未定义
+            if sym and sym not in mod_symbols.get(mod, set()):
+                issues.append(f"模块 {mod} 声明提供 '{sym}' 但文件中未定义该符号"
+                              f"(可能改名/孤儿文件/被同名影子模块遮蔽)")
+    for st in subtasks:                      # ② + ③ depends_on 解析
+        m = st.get("manifest", {}) or {}
+        mod = m.get("module") or ""
+        if mod == "main.py":
+            continue
+        for dep in (m.get("depends_on") or []):
+            dmod, dsym = _parse_dep(dep)
+            if not dmod:
+                continue
+            target = mod_basenames.get(dmod)
+            if not target:
+                issues.append(f"模块 {mod} 依赖 '{dep}' 但目标模块 '{dmod}' 从未被 delegate(缺失模块)")
+                continue
+            if dsym and dsym not in mod_symbols.get(target, set()):
+                issues.append(f"模块 {mod} 依赖 {target} 的 '{dsym}',但 {target} 未定义该符号(契约漂移)")
+    if main_code and main_code.strip():       # ④ + ⑤ main 接线
+        try:
+            mtree = ast.parse(main_code)
+        except SyntaxError:
+            mtree = None
+        if mtree:
+            imported, called = set(), set()
+            for node in ast.walk(mtree):
+                if isinstance(node, ast.Import):
+                    for a in node.names:
+                        imported.add((a.asname or a.name).split(".")[0])
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        imported.add(node.module.split(".")[0])
+                    for a in node.names:
+                        imported.add(a.name)
+                elif isinstance(node, ast.Call):
+                    f = node.func
+                    if isinstance(f, ast.Name):
+                        called.add((None, f.id))
+                    elif isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+                        called.add((f.value.id, f.attr))
+            for base in mod_basenames:        # ④ main 未接线模块
+                if base not in imported:
+                    issues.append(f"main.py 未 import 模块 '{mod_basenames[base]}'(该模块已交付但组合根未接线)")
+            all_provided = set()
+            for s in provided.values():
+                all_provided |= s
+            _builtins = {"print", "len", "range", "dict", "list", "str", "int", "float", "open",
+                         "set", "tuple", "bool", "enumerate", "zip", "map", "filter", "sorted",
+                         "isinstance", "type", "min", "max", "sum", "abs", "Exception", "ValueError",
+                         "TypeError", "KeyError", "IndexError", "RuntimeError", "AttributeError",
+                         "json", "os", "sys", "re", "time", "math"}
+            for modp, sym in called:          # ⑤ 调用的符号无模块提供
+                if modp is None:
+                    if sym in _builtins or sym in imported or sym in all_provided:
+                        continue
+                    issues.append(f"main.py 调用了 '{sym}()' 但无模块提供该符号(契约未兑现或名字拼错)")
+                else:
+                    if modp in mod_basenames:
+                        target = mod_basenames[modp]
+                        if sym not in mod_symbols.get(target, set()):
+                            issues.append(f"main.py 调用 {target}.{sym}() 但 {target} 未定义该符号(契约漂移)")
+    return issues
+
+
 def assemble(project_name: str) -> str:
     biz_subtasks = [st for st in SUBTASKS if st.get("manifest", {}).get("module") != "main.py"]
     if not biz_subtasks:
@@ -1224,6 +1343,16 @@ def assemble(project_name: str) -> str:
                        "⚠ 自动修复未完全解决;缺失模块请用 delegate 补齐后重新 assemble,其余失败点见上方"))
         else:
             lines.append("   ✅ 组装 + 冒烟通过,可直接 python main.py 运行")
+        # 运行时契约校验(符号级,纯 AST 机械检查):暴露孤儿/改名/影子/未接线等契约漂移。
+        # 与冒烟互补——冒烟只验「能跑」,契约校验验「接的对不对」。
+        if CONTRACT_CHECK:
+            cissues = _check_contracts(biz_subtasks, main_code)
+            if cissues:
+                lines.append(f"   ⚠ 契约校验发现 {len(cissues)} 处符号级漂移:")
+                for c in cissues:
+                    lines.append(f"     - {c}")
+                lines.append("     提示:模块间『数据形状』错配(如 main 平铺 dict 而消费方读嵌套)"
+                              "冒烟不报错,请用 verify 写真实断言暴露并修复。")
         return "\n".join(lines)
     except Exception as e:
         return f"[assemble 错误] {e}"
