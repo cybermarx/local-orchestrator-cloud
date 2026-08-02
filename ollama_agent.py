@@ -510,6 +510,8 @@ SUBSYS_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
 7. assemble 通过后直接结束(返回一句简短总结),不要写多余解释。
 8. 你【禁止】再调用 delegate_subsystem(你已是子树底层,再开子编排器会无限嵌套);
    若某模块仍太大,用普通 delegate,它会自行递归拆分。
+9. delegate 工具【没有】subdir 参数——不要给它传 subdir(会被拒绝);本子系统内的模块
+   会自动落到 {SUBDIR}/,你只需正常 delegate 并用 assemble 组装。
 """
 
 
@@ -542,11 +544,13 @@ def sub_orchestrate(task: str, name: str, provides: list, depends_on: list,
     built = os.path.join(PROJECT_DIR, subdir)
     target_rel = os.path.join(parent_project, subdir) if parent_project else subdir
     target = os.path.join(PROJECT_DIR, target_rel)
+    os.makedirs(os.path.dirname(target) or PROJECT_DIR, exist_ok=True)  # 父级目录兜底
     if os.path.isdir(built) and built != target:
         if os.path.isdir(target):
             shutil.rmtree(target)
         shutil.move(built, target)
     # 子编排器的内部 SUBTASKS 已在 _pop 时丢弃,这里扫描落盘目录重建内部模块清单以生成桥
+    os.makedirs(target, exist_ok=True)  # 首轮被截断/没真正组装时 target 可能还不存在
     init_code = _build_subpkg_init_from_dir(target, provides)
     try:
         with open(os.path.join(target, "__init__.py"), "w", encoding="utf-8") as f:
@@ -1722,7 +1726,8 @@ def _repair_module(st, error_text):
             "修复组合根 main.py",
             tier="pro",
             name="main.py",
-            contract={"provides": [], "depends_on": []},
+            provides=[],
+            depends_on=[],
             repair=repair,
             replace_id=st.get("id"),
         )
@@ -2082,6 +2087,39 @@ def ollama_subagent_chat(model, messages, timeout=None, use_json=True, think=Fal
     return acc
 
 
+def _coerce_list(v):
+    """把模型可能传成字符串的 provides/depends_on 归一化为 list。
+    兼容 JSON 数组文本、单引号数组、逗号/换行分隔等脏形态;签名内的逗号(如
+    tokenize(text, lang="en"))由引号匹配保护,不会被误拆。"""
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return [str(x) for x in v if str(x).strip()]
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        try:
+            j = json.loads(s)  # 合法 JSON 数组文本(双引号)
+            if isinstance(j, list):
+                return [str(x) for x in j if str(x).strip()]
+        except Exception:
+            pass
+        s2 = s
+        if s2.startswith("[") and s2.endswith("]"):   # 剥掉包裹方括号,避免被兜底当裸项
+            s2 = s2[1:-1].strip()
+            if not s2:
+                return []
+        parts = re.findall(r"""'([^']*)'|"([^"]*)"|([^,\n]+)""", s2)
+        out = []
+        for a, b, c in parts:
+            it = (a or b or c).strip().strip("\"'")
+            if it:
+                out.append(it)
+        return out
+    return [str(v)]
+
+
 def _dispatch_tool(tc: dict) -> str:
     fn = tc.get("function", {})
     name = fn.get("name", "")
@@ -2091,6 +2129,11 @@ def _dispatch_tool(tc: dict) -> str:
             args = json.loads(args) if args.strip() else {}
         except Exception:
             args = {}
+    # 模型常把 provides/depends_on 传成字符串(JSON 文本/单引号数组),归一化再派发
+    if isinstance(args, dict) and name in ("delegate", "delegate_subsystem"):
+        for _k in ("provides", "depends_on"):
+            if _k in args:
+                args[_k] = _coerce_list(args[_k])
     if name not in DISPATCH:
         return f"[未知工具] {name}"
     try:
@@ -2241,18 +2284,66 @@ def run_agent(query: str, history: list = None) -> str:
 # ----------------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------------
+FIX_COMMON_ERRORS_PROMPT = (
+    "对刚构建的这个项目做一轮『质量巡检与修复』,重点检查并修正常见错误:\n"
+    "1. 孤儿文件:落盘模块名与 main.py 的 import 是否一致(不一致则改 main 的 import 或补模块);\n"
+    "2. 影子模块:不要命名成与标准库/已装第三方库同名(如 requests.py),避免遮蔽真库自引用递归;\n"
+    "3. 契约错配:模块对外函数签名与 main.py 调用方式一致(参数顺序/返回值形状,字典是平铺还是嵌套);\n"
+    "4. 静默吞异常:except 里吞掉错误后返回假数据(如恒 0.0)的,改为抛错或打日志;\n"
+    "5. 未接线/死代码:已交付模块是否被 main.py 真正 import 并使用,重复代码清除;\n"
+    "6. 相对导入:扁平淡目录下 main.py 用绝对导入(from x import ...),不要 from .x import ...;\n"
+    "7. 校验:用 verify 写【真实断言】验证核心流程(禁止把失败测试改成恒真断言强行通过)。\n"
+    "修复后重新 assemble 并确保冒烟通过。"
+)
+
+_MANUAL = """\
+使用示例:
+  python ollama_agent.py --local "写一个 py 脚本..."                # 单次任务(全本地,串行递归)
+  python ollama_agent.py --local --improve 项目目录 "优化这里..."     # 目录模式:扫顶层 .py 载入侧边存储
+  python ollama_agent.py --local --improve 某个文件.py "重构它"       # 单文件模式:只载入这一份
+  python ollama_agent.py --local --fix-project 项目目录              # 项目回喂:巡检并修复常见错误
+  python ollama_agent.py                                           # 交互模式(不传 query)
+
+项目回喂标准流程:
+  构建完成后,把项目目录传给 --fix-project(等价于 --improve 目录 + 内置"检查并修复常见错误"提示词),
+  再带上 --local,让同一个 35B 对成品做一轮质量巡检与修复;也可用 query 自定义本次巡检要求。
+
+内置巡检项(FIX_COMMON_ERRORS_PROMPT):
+  孤儿文件 / 影子模块(遮蔽标准库与第三方库) / 契约错配(签名与返回形状) / 静默吞异常返回假数据 /
+  未接线死代码 / 相对导入 / verify 真实断言防作弊。
+
+环境变量(可选):
+  AGENT_NUM_CTX 编排器上下文窗口(默认8192)  AGENT_SUB_CTX_MAX 放大上限(默认24576,8GB显存勿再调大)
+  AGENT_BUDGET 压缩触发预算  AGENT_CONTRACT_CHECK 契约校验开关  AGENT_GUARD_SHADOW 影子模块告警
+  AGENT_MAX_ORCH_DEPTH 分层子编排器深度上限(默认2)
+"""
+
+
 def main():
     global DELEGATE_BACKEND
-    parser = argparse.ArgumentParser(description="本地编排器 + subagent(云端或本地) + 契约感知组装")
-    parser.add_argument("query", nargs="*", help="单次任务（不填则进入交互模式）")
+    parser = argparse.ArgumentParser(
+        description="🦙 本地多智能体编排器:串行递归 + 侧边存储 + 契约感知组装(全本地 Ollama 35B)",
+        epilog=_MANUAL,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("query", nargs="*", help="单次任务(不填则进入交互模式)")
     parser.add_argument("--local", action="store_true",
                         help="全本地模式:subagent 也用本地 Ollama(串行递归),完全不联网")
     parser.add_argument("--improve", metavar="PATH",
                         help="基于已有代码改进:PATH 可以是单个 .py 文件(改进这一份),"
                              "或目录(扫描其顶层 .py 载入侧边存储);随后执行改进任务(query)")
+    parser.add_argument("--fix-project", metavar="DIR",
+                        help="对已完成项目目录做一轮『巡检并修复常见错误』:等价于 --improve DIR + 内置修复提示词(可再附 query 自定义)")
     args = parser.parse_args()
     if args.local:
         DELEGATE_BACKEND = "ollama"
+
+    # --fix-project:项目完成后回喂 = --improve 目录 + 默认巡检修复提示词
+    if args.fix_project:
+        if not args.improve:
+            args.improve = args.fix_project
+        if not args.query:
+            args.query = [FIX_COMMON_ERRORS_PROMPT]
 
     # --improve:把已有代码载入侧边存储,并把「在此基础改进」的指引前置到任务里
     if args.improve:
