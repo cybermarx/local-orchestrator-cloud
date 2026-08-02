@@ -81,8 +81,11 @@ CTX_MARGIN = int(os.environ.get("AGENT_CTX_MARGIN", "256"))  # 给模板/特殊 
 # 本机通常只常驻一个模型,无法并行(Ollama 默认 OLLAMA_NUM_PARALLEL=1),故串行。
 LOCAL_SUBAGENT_MODEL = os.environ.get("AGENT_LOCAL_SUBAGENT_MODEL", "").strip() or MODEL
 LOCAL_DELEGATE_TRIES = int(os.environ.get("AGENT_LOCAL_TRIES", "2"))  # 本地慢,少重试
-SUB_NUM_CTX = int(os.environ.get("AGENT_SUB_NUM_CTX", "8192"))
-SUB_NUM_PREDICT = int(os.environ.get("AGENT_SUB_NUM_PREDICT", "2560"))
+# 注意:本 GGUF 不遵守 enable_thinking:false,think:false 仍会思考 8K+ token;
+# num_ctx 是 prompt+输出共用窗口,故必须 > 思考链长度,否则思考吃光窗口后
+# 模型在产出 content 前就被 done_reason=length 截断 → content 为空(已实测复现)。
+SUB_NUM_CTX = int(os.environ.get("AGENT_SUB_NUM_CTX", "16384"))
+SUB_NUM_PREDICT = int(os.environ.get("AGENT_SUB_NUM_PREDICT", "4096"))
 SUB_TEMPERATURE = float(os.environ.get("AGENT_SUB_TEMP", "0.3"))  # 写代码宜低温,减少退化
 MAX_CONTINUE = int(os.environ.get("AGENT_MAX_CONTINUE", "3"))     # 截断后最多续写几次
 LOCAL_TIMEOUT = int(os.environ.get("AGENT_LOCAL_TIMEOUT", "900"))
@@ -1167,7 +1170,9 @@ def _ollama_chat(messages: list, force_no_think: bool = False) -> dict:
         "num_predict": _output_budget(messages),
     }
     if force_no_think or not ENABLE_THINKING:
+        # think:false 是 Ollama 对 Qwen3 真正生效的关思考开关(enable_thinking 对本 GGUF 无效)
         opts["enable_thinking"] = False
+        opts["think"] = False
     payload = {
         "model": MODEL,
         "messages": messages,
@@ -1208,7 +1213,8 @@ def _ollama_complete(model, messages, num_ctx, num_predict, temperature, timeout
         "model": model,
         "messages": messages,
         "options": {"num_ctx": num_ctx, "temperature": temperature,
-                    "num_predict": num_predict, "enable_thinking": False},
+                    "num_predict": num_predict,
+                    "enable_thinking": False, "think": False},
         "stream": False,
     }
     resp = _ollama_raw(payload, timeout=timeout)
@@ -1235,6 +1241,18 @@ def ollama_subagent_chat(model, messages, timeout=None, use_json=True):
                   f"(已 {len(acc)} 字符)…", flush=True)
     if reason == "length":
         print(f"   ⚠ 续写 {MAX_CONTINUE} 次后仍未收尾,将尝试从残缺 JSON 中抢救代码", flush=True)
+    # 兜底:content 为空且因长度截断,多半是思考链(本 GGUF 即便 think:false 仍思考 8K+ token)
+    # 吃光了 num_ctx 窗口。放大 num_ctx 给思考留空间,再试一次(不计入 MAX_CONTINUE 续写额度)。
+    if not acc.strip() and reason == "length":
+        bigger = max(SUB_NUM_CTX, 32768)
+        if bigger > SUB_NUM_CTX:
+            print(f"   ↻ 疑似思考链耗光上下文窗口,放大 num_ctx={bigger} 重试一次…", flush=True)
+            content, reason = _ollama_complete(
+                model, messages, bigger, SUB_NUM_PREDICT, SUB_TEMPERATURE, timeout)
+            if content.strip():
+                acc = content
+                if reason == "length":
+                    print(f"   ⚠ 放大后仍被长度截断,将尝试从残缺 JSON 中抢救代码", flush=True)
     if not acc.strip():
         raise RuntimeError("本地 subagent 返回空内容")
     return acc
