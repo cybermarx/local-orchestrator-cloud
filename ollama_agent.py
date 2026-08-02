@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+本地编排器 + 云端 subagent + 本地链接器
+直连 Ollama(本地35B)作总指挥,唯一能力是把子任务 delegate 给英伟达云端模型,
+最后 link 把所有子任务组装成项目。纯标准库 + 本地 linker.py,零额外依赖。
+
+架构三层:
+  ① 本地 35B(本脚本):规划/调度,对话历史只放"指针",不存大段代码 → 永不撑爆。
+  ② 云端 subagent(NVIDIA):产模块 + manifest(结构化输出),各自独立、1M ctx。
+  ③ 本地 linker.py:确定性"动态连接器",解析依赖、落盘、校验,零 token。
+
+上下文管理:递归摘要压缩 maybe_compact + 默认 Qwen3 思考 + 撑爆自动关思考兜底(沿用)。
+
+用法:
+  python ollama_agent.py                 # 交互模式(像对话界面一样用)
+  python ollama_agent.py "任务"          # 单次任务
+  NVIDIA_API_KEY=nvapi-xxx python ollama_agent.py "写一个博客系统"
+
+环境变量:
+  OLLAMA_URL / AGENT_MODEL / AGENT_NUM_CTX / AGENT_MAX_ITER / AGENT_TEMP / AGENT_THINKING / AGENT_SUMMARIZE / AGENT_SUMMARY_MODE / AGENT_SUMMARIZER_MODEL / AGENT_TRUNCATE_CAP / AGENT_KEEP_RECENT / AGENT_COMPACT_ROUNDS  (沿用原有)
+  NVIDIA_API_KEY        可选;未设置时自动回退读取 Claude/WorkBuddy config 中的 nvapi- key
+  NVIDIA_KEY_CONFIG     可选;显式指定一个含 NVIDIA key 的 JSON config 路径(回退用)
+  NVIDIA_BASE_URL       默认 https://integrate.api.nvidia.com/v1(也可由 config 的 url 字段回退)
+  AGENT_NVIDIA_FLASH    默认 "deepseek-ai/deepseek-v4-flash, z-ai/glm-5.2, minimaxai/minimax-m3, stepfun-ai/step-3.7-flash"
+  AGENT_NVIDIA_PRO      默认 "deepseek-ai/deepseek-v4-pro, nvidia/llama-3.1-nemotron-ultra-253b-v1"
+  AGENT_DELEGATE_TIMEOUT 默认 120 (秒,单轮内失败会自动切换到下一个候选模型)
+  AGENT_LATENCY_WARN    默认 30 (秒,超过记降级)
+  AGENT_MODEL_COOLDOWN  默认 60 (秒,熔断冷却)
+  AGENT_MODEL_MAX_FAILS 默认 3 (连续失败次数触发熔断)
+  AGENT_DELEGATE_TRIES  默认 6 (failover 总尝试次数)
+  AGENT_429_BACKOFF     默认 5 (秒,账号级限速退避)
+  AGENT_PROJECT_DIR     默认 ./projects
+  AGENT_REPAIR_ROUNDS   默认 3 (链接后自动修复闭环的最大轮次)
+"""
+
+import json
+import os
+import sys
+import re
+import ast
+import time
+import subprocess
+import urllib.request
+import urllib.error
+import argparse
+import threading
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import linker
+
+# ----------------------------------------------------------------------------
+# 配置
+# ----------------------------------------------------------------------------
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+MODEL = os.environ.get("AGENT_MODEL", "fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:IQ2_M")
+NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "8192"))
+MAX_ITER = int(os.environ.get("AGENT_MAX_ITER", "12"))
+TEMPERATURE = float(os.environ.get("AGENT_TEMP", "0.7"))
+
+# ----------------------------------------------------------------------------
+# NVIDIA 凭证加载(优先 env,否则回退读取常见 Claude/WorkBuddy config)
+# ----------------------------------------------------------------------------
+def _search_nvidia_key(path):
+    """递归扫描 JSON config,返回 (nvapi-key, url-or-None)。找不到返回 (None, None)。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None, None
+    result = {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            for fk in ("apiKey", "api_key"):
+                v = node.get(fk)
+                if isinstance(v, str) and v.startswith("nvapi-"):
+                    result.setdefault("key", v)
+                    u = node.get("url") or node.get("baseUrl") or node.get("base_url")
+                    if isinstance(u, str):
+                        result.setdefault("url", u)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for it in node:
+                walk(it)
+
+    walk(data)
+    return result.get("key"), result.get("url")
+
+
+def _load_nvidia_credentials():
+    """解析 NVIDIA 凭证:优先环境变量,否则从常见 config 文件回退读取 nvapi- key。"""
+    env_key = os.environ.get("NVIDIA_API_KEY", "").strip()
+    if env_key:
+        return env_key, None, "环境变量 NVIDIA_API_KEY"
+    candidates = []
+    cfg = os.environ.get("NVIDIA_KEY_CONFIG", "").strip()
+    if cfg:
+        candidates.append(cfg)
+    candidates += [
+        os.path.expanduser("~/.workbuddy/models.json"),
+        os.path.expanduser("~/.claude.json"),
+        os.path.expanduser("~/.claude/settings.json"),
+    ]
+    for p in candidates:
+        if not p or not os.path.isfile(p):
+            continue
+        key, url = _search_nvidia_key(p)
+        if key:
+            return key, url, p
+    return "", None, None
+
+
+_NVIDIA_API_KEY, _FALLBACK_URL, _KEY_SOURCE = _load_nvidia_credentials()
+NVIDIA_API_KEY = _NVIDIA_API_KEY
+NVIDIA_BASE_URL = (
+    os.environ.get("NVIDIA_BASE_URL", "").strip()
+    or _FALLBACK_URL
+    or "https://integrate.api.nvidia.com/v1"
+).rstrip("/")
+NVIDIA_FLASH = [x.strip() for x in os.environ.get(
+    "AGENT_NVIDIA_FLASH",
+    "deepseek-ai/deepseek-v4-flash, z-ai/glm-5.2, minimaxai/minimax-m3, stepfun-ai/step-3.7-flash").split(",") if x.strip()]
+NVIDIA_PRO = [x.strip() for x in os.environ.get(
+    "AGENT_NVIDIA_PRO",
+    "deepseek-ai/deepseek-v4-pro, nvidia/llama-3.1-nemotron-ultra-253b-v1").split(",") if x.strip()]
+DELEGATE_TIMEOUT = int(os.environ.get("AGENT_DELEGATE_TIMEOUT", "120"))
+LATENCY_WARN = float(os.environ.get("AGENT_LATENCY_WARN", "30"))
+COOLDOWN = float(os.environ.get("AGENT_MODEL_COOLDOWN", "60"))
+MAX_FAILS = int(os.environ.get("AGENT_MODEL_MAX_FAILS", "3"))
+MAX_DELEGATE_TRIES = int(os.environ.get("AGENT_DELEGATE_TRIES", "6"))
+BACKOFF = float(os.environ.get("AGENT_429_BACKOFF", "5"))
+PROJECT_DIR = os.environ.get("AGENT_PROJECT_DIR", "./projects")
+REPAIR_ROUNDS = int(os.environ.get("AGENT_REPAIR_ROUNDS", "3"))
+
+MAX_OUTPUT_CHARS = 6000
+
+# compact 相关
+USE_SUMMARY = os.environ.get("AGENT_SUMMARIZE", "1").lower() not in ("0", "false", "no")
+SUMMARIZER_MODEL = os.environ.get("AGENT_SUMMARIZER_MODEL", MODEL)
+KEEP_RECENT = int(os.environ.get("AGENT_KEEP_RECENT", "6"))
+COMPACT_ROUNDS = int(os.environ.get("AGENT_COMPACT_ROUNDS", "8"))
+SUMMARY_MODE = os.environ.get("AGENT_SUMMARY_MODE", "model").lower()  # model | truncate
+TRUNCATE_CAP = int(os.environ.get("AGENT_TRUNCATE_CAP", "400"))
+# thinking：Qwen3 类思考模型默认先输出长链思考，可能把生成预算吃光，
+# 导致最终回答 content 为空（done_reason=length）。设 AGENT_THINKING=0 可关闭以提速并
+# 保证 content 落地；默认开启（纯文本轮次若返回空会自动重试关闭思考）。
+ENABLE_THINKING = os.environ.get("AGENT_THINKING", "1").lower() in ("1", "true", "yes", "on")
+# 安全预算：留出 20% 给模型生成，其余才给上下文
+BUDGET = int(NUM_CTX * 0.8)
+
+
+# ----------------------------------------------------------------------------
+# 侧边存储 + 路由器(上下文外,不进 35B 历史)
+# ----------------------------------------------------------------------------
+SUBTASKS = []  # [{"id","manifest":{...},"model","latency"}]
+
+
+class Nvidia429(Exception):
+    pass
+
+
+class ModelRouter:
+    """延迟感知 + 熔断的 subagent 路由器。"""
+    def __init__(self, flash, pro):
+        self.tiers = {"flash": list(flash), "pro": list(pro)}
+        self.stats = {}  # model -> {ema, fails, cooldown_until}
+
+    def _stat(self, m):
+        return self.stats.setdefault(m, {"ema": 0.0, "fails": 0, "cooldown_until": 0.0})
+
+    def select(self, tier, exclude=None):
+        now = time.time()
+        exclude = exclude or set()
+        cands = self.tiers.get(tier) or self.tiers["flash"]
+        healthy = [m for m in cands
+                   if m not in exclude
+                   and now >= self._stat(m)["cooldown_until"]
+                   and self._stat(m)["fails"] < MAX_FAILS]
+        if not healthy:
+            # 全部熔断/冷却/本轮回避:退而求其次,挑未冷却的;再不行就放开 exclude 随便给一个
+            healthy = [m for m in cands
+                       if m not in exclude and now >= self._stat(m)["cooldown_until"]] \
+                      or [m for m in cands if m not in exclude] \
+                      or list(cands)
+        # 优先 EMA 延迟最低,其次候选顺序
+        healthy.sort(key=lambda m: (self._stat(m)["ema"], cands.index(m)))
+        return healthy[0]
+
+    def report(self, model, latency, error):
+        s = self._stat(model)
+        if error:
+            s["fails"] += 1
+            if s["fails"] >= MAX_FAILS:
+                s["cooldown_until"] = time.time() + COOLDOWN
+        else:
+            s["fails"] = 0
+            if s["ema"] == 0:
+                s["ema"] = latency
+            else:
+                s["ema"] = s["ema"] * 0.7 + latency * 0.3
+            if latency > LATENCY_WARN:
+                s["ema"] = max(s["ema"], LATENCY_WARN * 1.5)  # 软降级:轻微惩罚
+
+    def status_line(self):
+        now = time.time()
+        parts = []
+        for tier, models in self.tiers.items():
+            for m in models:
+                s = self._stat(m)
+                flag = "⏸" if now < s["cooldown_until"] else ("✗" if s["fails"] >= MAX_FAILS else "✓")
+                ema = f"{s['ema']:.1f}s" if s["ema"] else "-"
+                parts.append(f"{m.split('/')[-1]}={flag}{ema}")
+        return " | ".join(parts)
+
+
+ROUTER = ModelRouter(NVIDIA_FLASH, NVIDIA_PRO)
+
+
+SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提供算力的「任务编排器」。
+你掌握用户的**总目标**,但你派出去的每一个云端 subagent 都**只知道自己的子目标**,不知道总目标——这是刻意的信息隔离,让每个 subagent 专注于自己的子任务、互不串扰。
+
+你有两个(可选三个)工具:
+- delegate(task, tier?, name?, provides?, depends_on?): 把一个子任务的**子目标**派给云端 subagent 完成。返回简短指针——真实成果存入「侧边存储」,不占对话上下文。
+- link(project_name): 所有子任务 delegate 完成后调用,把所有成果链接组装成项目(落盘+语法校验+导入冒烟),并对导入失败自动启动修复闭环,返回项目树。
+- verify(project_name, test_code): 【可选】链接后,用一个 Python 片段对生成的项目做**集成校验**(你掌握总目标,应写出能验证核心流程的断言,如 register 后 login 能拿到 token)。失败会自动回灌云端 subagent 修复并重新链接。
+
+工作方式(契约优先):
+1. 理解用户的**总目标**;
+2. 先做**模块契约设计**(这是唯一需要总目标的地方):把项目拆成若干模块,为每个模块确定
+   - module: 文件名
+   - provides: 它必须对外暴露的符号列表(函数/类名,尽量带签名,如 "get_user(id) -> User")
+   - depends_on: 它**实际会调用**的其它模块符号——**既要列读依赖,也要列写依赖**(例如注册模块既要依赖 "user_db:authenticate" 也要依赖 "user_db:create_user",因为注册必须把用户写进库)。格式 "模块:符号(签名)"。
+   契约是 subagent 之间对接的**唯一依据**,务必让 provides 与 depends_on 互相吻合(谁提供、谁消费要一致;尤其注意写流程的两端都要连上)。
+3. 逐个 delegate:每次只把**该模块的「子目标」+「契约」**(必提供的符号/签名、可依赖的符号/签名)传给 subagent。**绝不要把总目标写进 subagent 的提示**——subagent 只该看到自己的子目标与契约。
+4. 全部完成后调用 link 组装(会自动做导入冒烟与修复);若任务有明显 happy-path,再调用 verify 跑一个集成断言,让系统把逻辑错误也自动修掉。
+5. 简单聊天可直接回答,不必 delegate。
+
+规则:
+- delegate 的 task 就是该模块的「子目标」,要自包含、清晰。
+- provides/depends_on 是你(编排器)预先设计好的契约;若省略,subagent 会自行声明,但你可能需要在 link 前核对一致性。**务必把写依赖也写进 depends_on**,否则 subagent 可能自创一个不落库的实现(如注册只用内存字典)。
+- 若 delegate 返回错误,换种描述重试,或把任务拆更细再 delegate。
+- 你无法自己联网;需要实时信息时,云端模型会用其训练知识回答(可能非最新),请向用户说明。
+- 最终回答要简洁,引用 link/verify 返回的项目路径与校验结论。
+"""
+
+SUBAGENT_SYS = """你是一个代码 subagent。你只负责完成分配给你的**单个子任务**,你**不知道、也不需要知道**整个项目的总目标。
+
+你会收到:
+- [子目标] 这个模块要做什么(用你自己的理解实现即可)。
+- [必须提供的接口 provides] 你必须定义这些符号,签名须严格匹配(名字、参数、返回含义)。
+- [可依赖的接口 depends_on] 你实现时**只允许** import/调用这些外部符号,格式 "模块:符号(签名)"。除此之外不要假设存在任何其它模块或符号。**depends_on 里列出的每一个符号都必须在代码中真正被调用**(包括写操作,如把数据写回数据库的函数);如果你声明了某个依赖却没用到,说明契约没兑现。
+
+请只输出一个 JSON 对象(不要任何解释文字、不要用 markdown 代码块包裹):
+{
+  "module": "文件名,如 auth.py",
+  "language": "python",
+  "provides": ["你实际提供的符号,应与要求的 provides 一致"],
+  "depends_on": ["你实际依赖的符号,格式 '模块:符号'"],
+  "summary": "一句话说明这个子任务做了什么",
+  "code": "完整的源代码字符串"
+}
+要求:
+- code 必须定义 provides 中列出的每一个符号,且签名一致。
+- code 只可使用 depends_on 中列出的外部符号(其它一律当不存在),不要去"猜"或"协调"其它子任务。
+- code 必须是自洽、可独立存在的完整文件内容。
+- 只输出 JSON。
+"""
+
+
+# ----------------------------------------------------------------------------
+# 工具 schema(精简,控制总 token 数)
+# ----------------------------------------------------------------------------
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate",
+            "description": "把一个子任务派给英伟达云端模型(subagent)完成。用于需要生成代码/内容/计算的子任务。返回简短指针(真实成果存入侧边存储,不占上下文)。复杂任务请先自行分解为多个子任务,逐个 delegate。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "该模块的「子目标」:清晰、自包含、只描述本模块要做什么(不要写入总目标)"},
+                    "tier": {"type": "string", "enum": ["flash", "pro"], "description": "模型档位:flash=快/便宜,pro=强/慢。默认 flash"},
+                    "name": {"type": "string", "description": "可选的子任务名/编号,便于后续引用"},
+                    "provides": {"type": "array", "items": {"type": "string"}, "description": "本模块必须对外暴露的符号契约,如 ['get_user(id) -> User'];subagent 须严格按此实现。总目标不传于此。"},
+                    "depends_on": {"type": "array", "items": {"type": "string"}, "description": "本模块可依赖的其它模块符号契约,格式 '模块:符号(签名)'。subagent 只允许调用这些外部符号。"},
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "link",
+            "description": "把所有已完成的子任务(侧边存储中)链接组装成一个项目:解析依赖、落盘到项目目录、生成入口与 requirements、做语法校验,并自动做导入冒烟——导入失败的模块会启动自动修复闭环(回灌云端 subagent 修复后重新链接)。用于「写一个大项目」类任务收尾。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string", "description": "项目目录名"},
+                },
+                "required": ["project_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "verify",
+            "description": "对已 link 的项目做集成校验:你(编排器,掌握总目标)写一个 Python 片段导入生成模块并对核心流程断言(如 register 后 login 能拿到 token)。校验失败会自动把报错回灌给对应云端 subagent 修复并重新链接,直到通过或达到最大轮次。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string", "description": "项目目录名(须已 link)"},
+                    "test_code": {"type": "string", "description": "集成校验用的 Python 代码字符串(导入项目模块并做断言;项目目录已在 sys.path)"},
+                },
+                "required": ["project_name", "test_code"],
+            },
+        },
+    },
+]
+
+
+# ----------------------------------------------------------------------------
+# 云端 subagent 调用(NVIDIA)
+# ----------------------------------------------------------------------------
+def nvidia_chat(model, messages, timeout=DELEGATE_TIMEOUT, use_json=True):
+    if not NVIDIA_API_KEY:
+        raise RuntimeError(
+            "未找到 NVIDIA API key：请设置 NVIDIA_API_KEY 环境变量，或确保 "
+            "~/.workbuddy/models.json（或 NVIDIA_KEY_CONFIG 指定的文件）中含有 nvapi- 开头的 key"
+        )
+    payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 4096}
+    if use_json:
+        payload["response_format"] = {"type": "json_object"}
+    data = json.dumps(payload).encode()
+    headers = {"Authorization": f"Bearer {NVIDIA_API_KEY}", "Content-Type": "application/json"}
+    req = urllib.request.Request(
+        NVIDIA_BASE_URL + "/chat/completions", data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.load(r)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")[:300]
+        if e.code == 429:
+            raise Nvidia429(f"429 限速: {body}")
+        if e.code in (503, 529):
+            # 服务临时过载(免费层常见):当作可重试的限速,触发退避而非换模型
+            raise Nvidia429(f"{e.code} 服务过载: {body}")
+        if e.code == 400 and use_json:
+            # 该模型可能不支持 json_object,重试不带格式
+            return nvidia_chat(model, messages, timeout, use_json=False)
+        raise RuntimeError(f"NVIDIA HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"NVIDIA 连接失败: {e}")
+    return d["choices"][0]["message"]["content"]
+
+
+def parse_subagent_output(text):
+    if not text:
+        return {"module": "module.py", "code": "", "provides": [], "depends_on": [], "summary": ""}
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
+        t = re.sub(r"\n?```$", "", t).strip()
+    try:
+        obj = json.loads(t)
+    except Exception:
+        m = re.search(r"\{.*\}", t, re.S)
+        if m:
+            try:
+                obj = json.loads(m.group(0))
+            except Exception:
+                obj = {}
+        else:
+            obj = {}
+    if not isinstance(obj, dict):
+        obj = {}
+    return {
+        "module": obj.get("module") or "module.py",
+        "language": obj.get("language", "python"),
+        "provides": obj.get("provides") or [],
+        "depends_on": obj.get("depends_on") or [],
+        "summary": obj.get("summary", ""),
+        "code": obj.get("code", "") or t,
+    }
+
+
+def subagent_messages(task, contract=None):
+    parts = [f"[子目标]\n{task}"]
+    if contract:
+        provides = contract.get("provides") or []
+        depends_on = contract.get("depends_on") or []
+        if provides:
+            parts.append("[必须提供的接口 provides(严格按此签名实现)]\n" +
+                         "\n".join(f"- {p}" for p in provides))
+        if depends_on:
+            parts.append("[可依赖的接口 depends_on(只允许调用这些外部符号)]\n" +
+                         "\n".join(f"- {d}" for d in depends_on))
+    return [
+        {"role": "system", "content": SUBAGENT_SYS},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+
+
+def subagent_repair_messages(repair, contract=None):
+    """修复模式:把原始子目标 + 当前代码 + 报错 喂给 subagent,让它基于现有代码修正。
+    总目标仍不传入——subagent 依旧只见自己这块的上下文。"""
+    parts = [
+        "[修复任务] 你是一个代码 subagent。下面这个模块存在缺陷,需要在不改变其职责与契约的前提下修正它。",
+        f"[原始子目标]\n{repair.get('original_task', '')}",
+        f"[当前代码]\n```python\n{repair.get('current_code', '')}\n```",
+        f"[报错 / 校验失败信息]\n{repair.get('error', '')}",
+    ]
+    if contract:
+        provides = contract.get("provides") or []
+        depends_on = contract.get("depends_on") or []
+        if provides:
+            parts.append("[必须保持的接口 provides(签名严格不变)]\n" +
+                         "\n".join(f"- {p}" for p in provides))
+        if depends_on:
+            parts.append("[可依赖的接口 depends_on(只允许调用这些外部符号)]\n" +
+                         "\n".join(f"- {d}" for d in depends_on))
+    parts.append(
+        "[要求] 只修正错误,不要改变模块职责,保持模块名与 provides/depends_on 不变;"
+        "保持 depends_on 中声明的每个外部符号都被真正调用(含写操作)。"
+        "只输出修正后的完整 JSON(同原结构: module / language / provides / depends_on / summary / code)。"
+    )
+    return [
+        {"role": "system", "content": SUBAGENT_SYS},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+
+
+def _wait_printer(stop, model, label, interval=20):
+    """在阻塞的网络调用期间周期性打印等待提示,避免看起来像卡死。"""
+    waited = 0
+    while not stop.wait(interval):
+        waited += interval
+        print(f"   ⌛ 仍在等待 {model} 生成子任务'{label}'… 已 {waited}s", flush=True)
+
+
+def delegate(task: str, tier: str = "flash", name: str = None,
+             provides: list = None, depends_on: list = None,
+             repair: dict = None, replace_id: int = None) -> str:
+    """把子任务派给云端 subagent(延迟感知路由器 + 单轮内跨模型 failover)。
+    provides/depends_on 为编排器预先设计的契约(可选);传给 subagent 作接口约束,总目标不传入。
+    repair: 修复模式,传 {"original_task","current_code","error"} 让 subagent 基于现有代码修正(总目标仍不传)。
+    replace_id: 指定则原地更新该 SUBTASKS 条目(用于修复),否则追加新条目。
+    单轮内若某模型超时/失败会切换到下一个候选,避免反复卡在同一个过载模型上。"""
+    last_err = "未知错误"
+    contract = None
+    if provides or depends_on:
+        contract = {"provides": provides or [], "depends_on": depends_on or []}
+    tried = set()  # 本轮回避:同一模型本轮不再重试
+    label = name or task[:14]
+    for _ in range(MAX_DELEGATE_TRIES):
+        model = ROUTER.select(tier, exclude=tried)
+        t0 = time.perf_counter()
+        stop = threading.Event()
+        wp = threading.Thread(target=_wait_printer, args=(stop, model, label), daemon=True)
+        try:
+            print(f"   ⌛ 调用 {model} 生成子任务'{label}'…", flush=True)
+            wp.start()
+            msgs = subagent_repair_messages(repair, contract) if repair else subagent_messages(task, contract)
+            content = nvidia_chat(model, msgs, timeout=DELEGATE_TIMEOUT)
+            latency = time.perf_counter() - t0
+            stop.set(); wp.join(timeout=1)
+            ROUTER.report(model, latency, None)
+            manifest = parse_subagent_output(content)
+            if replace_id is not None:
+                for st in SUBTASKS:
+                    if st.get("id") == replace_id:
+                        st["manifest"] = manifest
+                        st["contract"] = contract
+                        st["model"] = model
+                        st["latency"] = round(latency, 1)
+                        tag = f"[{name}] " if name else ""
+                        return (f"{tag}子任务#{replace_id} 修复完成 | model={model} ({latency:.1f}s) | "
+                                f"module={manifest['module']} | 已更新侧边存储")
+            sid = len(SUBTASKS) + 1
+            SUBTASKS.append({
+                "id": sid,
+                "task": task,
+                "manifest": manifest,
+                "contract": contract,
+                "model": model,
+                "tier": tier,
+                "latency": round(latency, 1),
+            })
+            tag = f"[{name}] " if name else ""
+            return (f"{tag}子任务#{sid} 完成 | model={model} ({latency:.1f}s) | "
+                    f"module={manifest['module']} | provides={manifest['provides']} | "
+                    f"已存入侧边存储(不占上下文)")
+        except Nvidia429 as e:
+            stop.set(); wp.join(timeout=1)
+            latency = time.perf_counter() - t0
+            # 限速/过载是账号级且暂时的,不计入熔断(避免误冷却),仅退避后重试(不加入 tried,允许同模型)
+            last_err = str(e)
+            time.sleep(BACKOFF)
+            continue
+        except KeyboardInterrupt:
+            stop.set(); wp.join(timeout=1)
+            return f"[delegate 已取消] 子任务'{label}'被用户中断"
+        except Exception as e:
+            stop.set(); wp.join(timeout=1)
+            latency = time.perf_counter() - t0
+            ROUTER.report(model, latency, True)
+            tried.add(model)  # 本轮内不再重试同一模型,切换到下一个候选
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+    return f"[delegate 失败] 所有候选模型均不可用({last_err})。可换种描述重试,或拆分更细的子任务。"
+
+
+def link(project_name: str) -> str:
+    if not SUBTASKS:
+        return "[link] 侧边存储中没有已完成子任务,请先 delegate 若干子任务。"
+    out_dir = os.path.join(PROJECT_DIR, project_name or "project")
+    try:
+        rep = linker.link_project(SUBTASKS, out_dir)
+        lines = [linker.format_report(rep)]
+        # 导入冒烟 + 自动修复闭环
+        smoke = linker.import_smoke(out_dir)
+        bad = [s for s in smoke if not s["ok"]]
+        if bad:
+            lines.append(f"   ⚠ 导入冒烟: {len(bad)}/{len(smoke)} 模块导入失败,启动自动修复闭环")
+            rlog, ok = repair_loop(out_dir, lambda d: _check_import(d))
+            lines += rlog
+            lines.append("   " + ("✅ 修复后导入全部正常" if ok else "⚠ 自动修复未完全解决,见上方失败点;可手动检查或重 delegate"))
+        else:
+            lines.append(f"   ✅ 导入冒烟: {len(smoke)}/{len(smoke)} 模块导入正常")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[link 错误] {e}"
+
+
+# ----------------------------------------------------------------------------
+# 校验 + 自动修复闭环(链接→校验→把错误回灌云端 subagent→重新链接)
+# ----------------------------------------------------------------------------
+def _project_modules(out_dir):
+    return [os.path.basename(p) for p in linker.list_modules(out_dir)]
+
+
+def _module_from_traceback(tb_text, module_names):
+    """从 traceback 中定位失败所属的项目模块。
+    优先用出错帧的文件名;其次扫描 traceback 源码行里出现的 '模块名.'(如 auth.login),
+    这样集成测试(test_smoke.py 抛错)也能定位到真正出问题的业务模块。"""
+    for line in (tb_text or "").splitlines():
+        m = re.search(r'File "([^"]+)"', line)
+        if m:
+            fn = os.path.basename(m.group(1))
+            if fn in module_names:
+                return fn
+    for name in module_names:
+        if re.search(r'\b' + re.escape(name) + r'\.', tb_text or ""):
+            return name
+    return None
+
+
+def _map_module_to_subtask(module_basename):
+    for st in SUBTASKS:
+        mm = (st.get("manifest", {}).get("module") or "")
+        if mm == module_basename or mm.endswith(module_basename):
+            return st
+    return None
+
+
+def _check_import(out_dir):
+    smoke = linker.import_smoke(out_dir)
+    fails = [{"module": s["module"], "error": s["detail"]} for s in smoke if not s["ok"]]
+    return (len(fails) == 0, fails)
+
+
+def _check_test(out_dir, test_code):
+    # 路径必须绝对化:out_dir 来自相对 PROJECT_DIR(如 ./projects),
+    # 若 path 用相对路径 + cwd=out_dir,子进程会把相对 path 再次基于 cwd 解析,造成路径翻倍。
+    abs_out = os.path.abspath(out_dir)
+    path = os.path.join(abs_out, "test_smoke.py")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(test_code)
+        r = subprocess.run([sys.executable, path], capture_output=True, text=True,
+                           cwd=abs_out, timeout=DELEGATE_TIMEOUT)
+        ok = r.returncode == 0
+        tb = (r.stderr or "") + "\n" + (r.stdout or "")
+        fails = [] if ok else [{"module": None, "error": tb[-2500:]}]
+        return ok, fails
+    except subprocess.TimeoutExpired:
+        return False, [{"module": None, "error": "集成测试超时(>%ds)" % DELEGATE_TIMEOUT}]
+    except Exception as e:
+        return False, [{"module": None, "error": f"{type(e).__name__}: {e}"}]
+
+
+def _repair_module(st, error_text):
+    """用云端 subagent 修复单个子任务(原地更新 SUBTASKS 条目)。"""
+    manifest = st.get("manifest", {})
+    repair = {
+        "original_task": st.get("task") or manifest.get("summary") or "",
+        "current_code": manifest.get("code", ""),
+        "error": error_text,
+    }
+    contract = st.get("contract") or {}
+    delegate(
+        f"修复模块 {manifest.get('module')}",
+        tier=st.get("tier", "flash"),
+        name=manifest.get("module"),
+        provides=contract.get("provides"),
+        depends_on=contract.get("depends_on"),
+        repair=repair,
+        replace_id=st.get("id"),
+    )
+
+
+def _modules_imported_by_test(test_code):
+    """从集成测试代码里提取它 import 的顶层模块名(用于 verify 失败时的修复范围)。"""
+    names = set()
+    try:
+        tree = ast.parse(test_code)
+    except Exception:
+        return names
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for n in node.names:
+                names.add(n.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                names.add(node.module.split(".")[0])
+    return names
+
+
+def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
+    """check_fn(out_dir) -> (ok, failures[{module?,error}])。
+    逐轮:定位失败模块→云端修复→重链→再校验,直到通过或轮次耗尽。
+    scope: 当无法从 traceback 定位时,回退修复这些模块(verify 用于指定测试 import 的模块)。"""
+    log = []
+    ok, fails = check_fn(out_dir)
+    if ok:
+        return log, True
+    # 模块名集合:以 SUBTASKS 中实际委托的模块为准(权威),避免把 verify 写入的 test_smoke.py 也算进来
+    module_names = {os.path.basename(st.get("manifest", {}).get("module", ""))
+                    for st in SUBTASKS if st.get("manifest", {}).get("module")}
+    for rnd in range(1, rounds + 1):
+        log.append(f"   🔧 修复轮次 {rnd}/{rounds}: {len(fails)} 个失败点")
+        targets = []
+        for f in fails:
+            mod = f.get("module") or _module_from_traceback(f.get("error", ""), module_names)
+            if mod:
+                st = _map_module_to_subtask(mod)
+                if st and st not in targets:
+                    targets.append(st)
+        if not targets and scope:
+            # 集成测试(断言失败)的 traceback 往往不点名模块,改用测试 import 的模块范围
+            for mod in scope:
+                st = _map_module_to_subtask(mod if mod.endswith(".py") else mod + ".py")
+                if st and st not in targets:
+                    targets.append(st)
+        if not targets:
+            log.append("     - 无法把失败映射到任何子任务,停止自动修复")
+            break
+        full_err = "\n".join(f.get("error", "") for f in fails)[:3000]
+        for st in targets:
+            _repair_module(st, full_err)
+        linker.link_project(SUBTASKS, out_dir)  # 用修复后的代码重链
+        log.append("     - 已用修复后的代码重新链接项目")
+        ok, fails = check_fn(out_dir)
+        if ok:
+            log.append(f"   ✅ 第 {rnd} 轮修复后校验通过")
+            return log, True
+    return log, ok
+
+
+def verify(project_name: str, test_code: str) -> str:
+    if not SUBTASKS:
+        return "[verify] 侧边存储为空,请先 delegate 并 link。"
+    out_dir = os.path.join(PROJECT_DIR, project_name or "project")
+    if not os.path.isdir(out_dir):
+        return f"[verify] 项目目录不存在: {out_dir},请先 link。"
+    try:
+        ok, fails = _check_test(out_dir, test_code)
+        if ok:
+            return f"✅ 集成校验通过(项目: {project_name})"
+        lines = [f"⚠ 集成校验失败,启动自动修复闭环(项目: {project_name})"]
+        # 集成测试的 traceback 通常不点名模块,改用测试 import 的模块作为修复范围。
+        # scope 统一存成 manifest 里的文件名(如 auth.py),与失败点/映射函数的口径一致。
+        scope = set()
+        for m in _modules_imported_by_test(test_code):
+            for st in SUBTASKS:
+                mod = st.get("manifest", {}).get("module", "")
+                if mod and (mod == m + ".py" or mod.endswith("/" + m + ".py")):
+                    scope.add(mod)
+        rlog, fixed = repair_loop(out_dir, lambda d: _check_test(d, test_code), scope=scope)
+        lines += rlog
+        lines.append("   " + ("✅ 修复后集成校验通过" if fixed else "⚠ 自动修复未完全解决,见上方失败点"))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"[verify 错误] {e}"
+
+
+DISPATCH = {
+    "delegate": delegate,
+    "link": link,
+    "verify": verify,
+}
+
+
+# ----------------------------------------------------------------------------
+# token 估算(CJK 感知)
+# ----------------------------------------------------------------------------
+def _est_text(s: str) -> int:
+    if not s:
+        return 0
+    cjk = 0
+    for ch in s:
+        if "\u4e00" <= ch <= "\u9fff":
+            cjk += 1
+    n = len(s) - cjk
+    return int(cjk * 0.6 + n * 0.25) + 1
+
+
+def _msg_tokens(m: dict) -> int:
+    c = m.get("content") or ""
+    extra = ""
+    if m.get("tool_calls"):
+        extra = json.dumps(m["tool_calls"], ensure_ascii=False)
+    return _est_text(c) + _est_text(extra)
+
+
+def history_tokens(messages: list) -> int:
+    total = 0
+    if messages and messages[0].get("role") == "system":
+        total += _est_text(messages[0].get("content", ""))
+    total += _est_text(json.dumps(TOOLS, ensure_ascii=False))
+    for m in messages:
+        total += _msg_tokens(m)
+    return total
+
+
+# ----------------------------------------------------------------------------
+# Ollama 通信(原生 /api/chat)
+# ----------------------------------------------------------------------------
+def _ollama_raw(payload: dict) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/chat",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _ollama_chat(messages: list, force_no_think: bool = False) -> dict:
+    opts = {"num_ctx": NUM_CTX, "temperature": TEMPERATURE}
+    if force_no_think or not ENABLE_THINKING:
+        opts["enable_thinking"] = False
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "tools": TOOLS,
+        "options": opts,
+        "stream": False,
+    }
+    return _ollama_raw(payload)
+
+
+def _dispatch_tool(tc: dict) -> str:
+    fn = tc.get("function", {})
+    name = fn.get("name", "")
+    args = fn.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except Exception:
+            args = {}
+    if name not in DISPATCH:
+        return f"[未知工具] {name}"
+    try:
+        return DISPATCH[name](**args)
+    except TypeError as e:
+        return f"[参数错误] 工具 {name}: {e}"
+
+
+# ----------------------------------------------------------------------------
+# 递归摘要压缩(对标 Claude Code 混合代理的 summary-based compaction)
+# ----------------------------------------------------------------------------
+_SUM_SYS = (
+    "你是对话压缩器。把下面这段对话记录（用户指令、子任务委派、subagent 返回、模型回应）"
+    "压缩成一段简洁中文摘要，保留：用户的最终目标、已委派/完成的子任务及其产出模块、关键结论、"
+    "任何未解决的要点。不要添加原文没有的信息。直接输出摘要文本，不要使用 markdown 标题。"
+)
+
+
+def summarize_chunk(chunk: list) -> str:
+    if not chunk:
+        return ""
+    lines = []
+    for m in chunk:
+        role = m.get("role", "?")
+        c = m.get("content") or ""
+        if role == "tool":
+            c = f"[工具 {m.get('name', '')} 返回] {c}"
+        elif role == "assistant" and m.get("tool_calls"):
+            names = ", ".join(
+                tc.get("function", {}).get("name", "?") for tc in m["tool_calls"]
+            )
+            c = (c + f" [调用工具: {names}]") if c else f"[调用工具: {names}]"
+        lines.append(f"{role}: {c}")
+    text = "\n".join(lines)
+
+    payload = {
+        "model": SUMMARIZER_MODEL,
+        "messages": [
+            {"role": "system", "content": _SUM_SYS},
+            {"role": "user", "content": text},
+        ],
+        "options": {"num_ctx": min(NUM_CTX, 4096), "temperature": 0.2},
+        "stream": False,
+    }
+    try:
+        resp = _ollama_raw(payload)
+        d = resp.get("message", {}).get("content", "").strip()
+        return d or text[:1200]
+    except Exception:
+        return text[:1200]
+
+
+def truncate_chunk(chunk: list, cap: int = TRUNCATE_CAP) -> str:
+    if not chunk:
+        return ""
+    lines = []
+    for m in chunk:
+        role = m.get("role", "?")
+        c = m.get("content") or ""
+        if len(c) > cap:
+            c = f"{c[:cap]}\n...[该条已抽取式截断，原 {len(c)} 字符]"
+        if role == "tool":
+            c = f"[工具 {m.get('name', '')} 返回] {c}"
+        elif role == "assistant" and m.get("tool_calls"):
+            names = ", ".join(
+                tc.get("function", {}).get("name", "?") for tc in m["tool_calls"]
+            )
+            c = (c + f" [调用工具: {names}]") if c else f"[调用工具: {names}]"
+        lines.append(f"{role}: {c}")
+    return "\n".join(lines)
+
+
+def maybe_compact(messages: list) -> None:
+    for _ in range(COMPACT_ROUNDS):
+        if history_tokens(messages) <= BUDGET:
+            return
+        if len(messages) <= 1 + KEEP_RECENT:
+            break
+        tail = messages[-KEEP_RECENT:]
+        head = messages[1:-KEEP_RECENT]
+        if not head:
+            break
+        if USE_SUMMARY:
+            if SUMMARY_MODE == "truncate":
+                digest = truncate_chunk(head)
+            else:
+                digest = summarize_chunk(head)
+            digest_msg = {"role": "assistant", "content": f"[历史摘要]\n{digest}"}
+        else:
+            digest_msg = {"role": "assistant", "content": "[历史摘要] (已省略早期对话以节省上下文)"}
+        messages[:] = [messages[0]] + [digest_msg] + tail
+
+    if history_tokens(messages) > BUDGET and len(messages) > 1 + 4:
+        messages[:] = [messages[0]] + messages[-4:]
+
+
+# ----------------------------------------------------------------------------
+# Agent 主循环
+# ----------------------------------------------------------------------------
+def run_agent(query: str, history: list = None) -> str:
+    messages = history if history is not None else [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.append({"role": "user", "content": query})
+
+    for step in range(1, MAX_ITER + 1):
+        maybe_compact(messages)
+        try:
+            resp = _ollama_chat(messages)
+        except urllib.error.URLError as e:
+            return f"[无法连接 Ollama] 确认 Ollama 已启动且监听 {OLLAMA_URL}：{e}"
+
+        msg = resp.get("message", {})
+        if ENABLE_THINKING:
+            had_error = "error" in resp
+            empty_final = (not msg.get("tool_calls")) and not msg.get("content", "").strip()
+            if had_error or empty_final:
+                try:
+                    resp2 = _ollama_chat(messages, force_no_think=True)
+                    if "error" not in resp2:
+                        resp, msg = resp2, resp2.get("message", {})
+                except Exception:
+                    pass
+
+        if "error" in resp:
+            return f"[Ollama 错误] {resp['error']}"
+
+        if msg.get("tool_calls"):
+            content = msg.get("content", "")
+            print(f"\n🤖 思考: {content}" if content else f"\n🤖 第 {step} 步: 调用工具")
+            messages.append(msg)
+            for tc in msg["tool_calls"]:
+                name = tc.get("function", {}).get("name", "?")
+                args = tc.get("function", {}).get("arguments", {})
+                print(f"   🔧 {name}({args if not isinstance(args, str) else args})")
+                result = _dispatch_tool(tc)
+                print(f"   ↳ {result.splitlines()[0][:140]}")
+                messages.append({"role": "tool", "content": result, "name": name})
+            continue
+
+        final = msg.get("content", "").strip()
+        messages.append(msg)
+        if history is not None:
+            history[:] = messages
+        return final or "[模型未返回内容]"
+
+    return f"[已达最大迭代 {MAX_ITER}，未完成]"
+
+
+# ----------------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="本地编排器 + 云端 subagent + 本地链接器")
+    parser.add_argument("query", nargs="*", help="单次任务（不填则进入交互模式）")
+    args = parser.parse_args()
+
+    print(f"🦙 本地编排器 | 模型={MODEL} | num_ctx={NUM_CTX} | Ollama={OLLAMA_URL}")
+    print(f"   compact: mode={SUMMARY_MODE if USE_SUMMARY else 'off'} | thinking={'on' if ENABLE_THINKING else 'off'} | 预算={BUDGET} token")
+    print(f"   工具: delegate(云端subagent) + link(本地连接器) + verify(集成校验+自动修复) | NVIDIA档: flash={len(NVIDIA_FLASH)} pro={len(NVIDIA_PRO)}")
+    if not NVIDIA_API_KEY:
+        print("   ⚠ 未检测到 NVIDIA_API_KEY —— delegate 将报错,请先 export NVIDIA_API_KEY=nvapi-... 或在 config 中配置")
+    else:
+        masked = NVIDIA_API_KEY[:10] + "…" + NVIDIA_API_KEY[-4:]
+        src = _KEY_SOURCE or "环境变量"
+        print(f"   🔑 NVIDIA key: {masked} (来源: {src})")
+
+    if args.query:
+        q = " ".join(args.query)
+        print(f"\n👤 {q}")
+        try:
+            ans = run_agent(q)
+        except KeyboardInterrupt:
+            print("\n   ⏹ 已取消")
+            return
+        print(f"\n🤖 {ans}")
+        return
+
+    history = [{"role": "system", "content": SYSTEM_PROMPT}]
+    print("\n交互模式（输入 exit / quit / 按 Ctrl-C 退出）\n")
+    while True:
+        try:
+            q = input("👤 ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 再见")
+            break
+        if not q:
+            continue
+        if q.lower() in ("exit", "quit", "q"):
+            print("👋 再见")
+            break
+        try:
+            ans = run_agent(q, history=history)
+        except KeyboardInterrupt:
+            print("\n   ⏹ 已取消当前任务(已完成的子任务仍保留在内存,可继续 link 或重新 delegate)")
+            continue
+        print(f"\n🤖 {ans}")
+        print(f"   [路由器状态] {ROUTER.status_line()}")
+
+
+if __name__ == "__main__":
+    main()

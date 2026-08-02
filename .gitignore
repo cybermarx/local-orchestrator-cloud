@@ -1,0 +1,10 @@
+# 默认忽略一切（避免把密钥/日志/缓存/配置误提交）
+*
+!.gitignore
+
+# 仅跟踪需要备份的源码快照
+!ollama_agent.py
+!linker.py
+!nvidia-claude-proxy.js
+!CLAUDE.md
+!README.md
