@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-本地编排器 + 云端 subagent + 本地链接器
+本地编排器 + 云端 subagent + 本地冒烟验证器(去 linker)
 直连 Ollama(本地35B)作总指挥,唯一能力是把子任务 delegate 给英伟达云端模型,
-最后 link 把所有子任务组装成项目。纯标准库 + 本地 linker.py,零额外依赖。
+最后 link 把所有子任务组装成项目。纯标准库 + 本地 smoke.py,零额外依赖。
+
+设计要点(去 linker):Python 的 import 系统本身就是 linker——模块=文件=命名空间,
+同目录放好文件即连通,无需独立接线。本脚本只负责:① 编排器设计模块契约 + 写 main.py
+(组合根);② 把各模块交给云端 subagent 实现;③ link 时把所有文件落到同目录,用
+smoke.py 做「导入全部模块 + 真正调用 main 入口」的契约感知冒烟,失败按 manifest 回灌修复。
 
 架构三层:
   ① 本地 35B(本脚本):规划/调度,对话历史只放"指针",不存大段代码 → 永不撑爆。
   ② 云端 subagent(NVIDIA):产模块 + manifest(结构化输出),各自独立、1M ctx。
-  ③ 本地 linker.py:确定性"动态连接器",解析依赖、落盘、校验,零 token。
+  ③ 本地 smoke.py:确定性"冒烟验证器",落盘 + 导入/执行校验,零 token。
 
 上下文管理:递归摘要压缩 maybe_compact + 默认 Qwen3 思考 + 撑爆自动关思考兜底(沿用)。
 
@@ -47,7 +52,7 @@ import argparse
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import linker
+import smoke
 
 # ----------------------------------------------------------------------------
 # 配置
@@ -155,6 +160,7 @@ BUDGET = int(NUM_CTX * 0.8)
 # 侧边存储 + 路由器(上下文外,不进 35B 历史)
 # ----------------------------------------------------------------------------
 SUBTASKS = []  # [{"id","manifest":{...},"model","latency"}]
+MAIN_CODE = ""  # 编排器写的主函数(组合根),由 write_main 工具暂存,link 时一并落盘
 
 
 class Nvidia429(Exception):
@@ -221,12 +227,13 @@ ROUTER = ModelRouter(NVIDIA_FLASH, NVIDIA_PRO)
 SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提供算力的「任务编排器」。
 你掌握用户的**总目标**,但你派出去的每一个云端 subagent 都**只知道自己的子目标**,不知道总目标——这是刻意的信息隔离,让每个 subagent 专注于自己的子任务、互不串扰。
 
-你有两个(可选三个)工具:
+你有这些工具:
 - delegate(task, tier?, name?, provides?, depends_on?): 把一个子任务的**子目标**派给云端 subagent 完成。返回简短指针——真实成果存入「侧边存储」,不占对话上下文。
-- link(project_name): 所有子任务 delegate 完成后调用,把所有成果链接组装成项目(落盘+语法校验+导入冒烟),并对导入失败自动启动修复闭环,返回项目树。
-- verify(project_name, test_code): 【可选】链接后,用一个 Python 片段对生成的项目做**集成校验**(你掌握总目标,应写出能验证核心流程的断言,如 register 后 login 能拿到 token)。失败会自动回灌云端 subagent 修复并重新链接。
+- write_main(project_name, main_code): 你(编排器,掌握总目标)亲自写**主函数 main.py(组合根)**。它 import 各模块、按你设计的契约调用它们,把整个项目串起来。main.py 必须严格按 provides/depends_on 约定的**名字与签名**调用各模块符号——这是「去 linker」设计下唯一需要你保证接口一致的地方(同目录放文件即可,import 会自行接线)。这里只暂存代码,落盘由 link 统一做。
+- link(project_name): 所有模块 delegate 完成、且你已 write_main 后调用。它把所有模块文件 + main.py 落到同一目录(无需接线,Python import 即 linker),然后做「导入全部模块 + 真正调用 main 入口」的契约感知冒烟;对冒烟失败(符号名/签名漂移、缺失模块、循环依赖)自动启动修复闭环,返回项目树。
+- verify(project_name, test_code): 【可选】link 后,用一个 Python 片段对生成的项目做**集成校验**(你掌握总目标,应写出能验证核心流程的断言,如 register 后 login 能拿到 token)。失败会自动回灌云端 subagent 修复并重新组装。
 
-工作方式(契约优先):
+工作方式(契约优先,去 linker):
 1. 理解用户的**总目标**;
 2. 先做**模块契约设计**(这是唯一需要总目标的地方):把项目拆成若干模块,为每个模块确定
    - module: 文件名
@@ -234,8 +241,9 @@ SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
    - depends_on: 它**实际会调用**的其它模块符号——**既要列读依赖,也要列写依赖**(例如注册模块既要依赖 "user_db:authenticate" 也要依赖 "user_db:create_user",因为注册必须把用户写进库)。格式 "模块:符号(签名)"。
    契约是 subagent 之间对接的**唯一依据**,务必让 provides 与 depends_on 互相吻合(谁提供、谁消费要一致;尤其注意写流程的两端都要连上)。
 3. 逐个 delegate:每次只把**该模块的「子目标」+「契约」**(必提供的符号/签名、可依赖的符号/签名)传给 subagent。**绝不要把总目标写进 subagent 的提示**——subagent 只该看到自己的子目标与契约。
-4. 全部完成后调用 link 组装(会自动做导入冒烟与修复);若任务有明显 happy-path,再调用 verify 跑一个集成断言,让系统把逻辑错误也自动修掉。
-5. 简单聊天可直接回答,不必 delegate。
+4. 你亲自写 main.py:基于上面设计的契约,import 各模块、按约定名字/签名调用它们,串成完整流程。用 write_main 暂存(务必让 import 名与 provides 完全一致)。
+5. 调用 link 组装(会自动冒烟与修复);若任务有明显 happy-path,再调用 verify 跑一个集成断言,让系统把逻辑错误也自动修掉。
+6. 简单聊天可直接回答,不必 delegate。
 
 规则:
 - delegate 的 task 就是该模块的「子目标」,要自包含、清晰。
@@ -294,8 +302,23 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "write_main",
+            "description": "编排器亲自写主函数 main.py(组合根):import 各模块、按契约调用它们串起整个项目。main.py 必须严格按 provides/depends_on 约定的名字与签名调用各模块符号。这里只把代码暂存到侧边存储,落盘由 link 统一做。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project_name": {"type": "string", "description": "项目目录名(须与后续 link 一致)"},
+                    "main_code": {"type": "string", "description": "完整的 main.py 源码字符串(须定义 def main(): 且 if __name__=='__main__': main())"},
+                },
+                "required": ["project_name", "main_code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "link",
-            "description": "把所有已完成的子任务(侧边存储中)链接组装成一个项目:解析依赖、落盘到项目目录、生成入口与 requirements、做语法校验,并自动做导入冒烟——导入失败的模块会启动自动修复闭环(回灌云端 subagent 修复后重新链接)。用于「写一个大项目」类任务收尾。",
+            "description": "把所有已完成的子任务(侧边存储中)与 write_main 暂存的 main.py 组装成一个项目:落到同一目录(Python import 即 linker,不做接线)、做语法校验,并自动做「导入全部模块 + 调用 main 入口」的契约感知冒烟——冒烟失败(符号名/签名漂移、缺失模块、循环依赖)会启动自动修复闭环(回灌云端 subagent 修复后重新组装)。用于「写一个大项目」类任务收尾。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -309,7 +332,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "verify",
-            "description": "对已 link 的项目做集成校验:你(编排器,掌握总目标)写一个 Python 片段导入生成模块并对核心流程断言(如 register 后 login 能拿到 token)。校验失败会自动把报错回灌给对应云端 subagent 修复并重新链接,直到通过或达到最大轮次。",
+            "description": "对已 link 的项目做集成校验:你(编排器,掌握总目标)写一个 Python 片段导入生成模块并对核心流程断言(如 register 后 login 能拿到 token)。校验失败会自动把报错回灌给对应云端 subagent 修复并重新组装,直到通过或达到最大轮次。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -514,35 +537,43 @@ def delegate(task: str, tier: str = "flash", name: str = None,
     return f"[delegate 失败] 所有候选模型均不可用({last_err})。可换种描述重试,或拆分更细的子任务。"
 
 
+def write_main(project_name: str, main_code: str) -> str:
+    """编排器(掌握总目标)亲自写组合根 main.py,暂存到 MAIN_CODE,link 时一并落盘。"""
+    global MAIN_CODE
+    MAIN_CODE = main_code or ""
+    if not MAIN_CODE.strip():
+        return "[write_main] 收到空代码,未暂存。请传入完整的 main.py 源码。"
+    if "def main(" not in MAIN_CODE:
+        return ("[write_main] 已暂存,但警告:main_code 未定义 def main(),"
+                "smoke 将报『main.py 未定义 main() 入口』。建议补上 def main(): 与"
+                " if __name__ == '__main__': main()。")
+    return ("[write_main] 已暂存 main.py(组合根)。调用 link 即可与所有子任务模块"
+            "组装到同一目录并做契约感知冒烟。")
+
+
 def link(project_name: str) -> str:
     if not SUBTASKS:
-        return "[link] 侧边存储中没有已完成子任务,请先 delegate 若干子任务。"
+        return "[link] 侧边存储中没有已完成子任务,请先 delegate 若干子任务(并 write_main 组合根)。"
     out_dir = os.path.join(PROJECT_DIR, project_name or "project")
     try:
-        rep = linker.link_project(SUBTASKS, out_dir)
-        lines = [linker.format_report(rep)]
-        # 导入冒烟 + 自动修复闭环
-        smoke = linker.import_smoke(out_dir)
-        bad = [s for s in smoke if not s["ok"]]
-        if bad:
-            lines.append(f"   ⚠ 导入冒烟: {len(bad)}/{len(smoke)} 模块导入失败,启动自动修复闭环")
-            rlog, ok = repair_loop(out_dir, lambda d: _check_import(d))
+        written = smoke.assemble(out_dir, SUBTASKS, MAIN_CODE)
+        ok, failures = smoke.smoke_project(out_dir)
+        lines = [smoke.format_report(out_dir, written, ok, failures)]
+        if not ok:
+            lines.append(f"   ⚠ 冒烟发现 {len(failures)} 个失败点,启动自动修复闭环")
+            rlog, fixed = repair_loop(out_dir, lambda d: smoke.smoke_project(d))
             lines += rlog
-            lines.append("   " + ("✅ 修复后导入全部正常" if ok else "⚠ 自动修复未完全解决,见上方失败点;可手动检查或重 delegate"))
+            lines.append("   " + ("✅ 修复后冒烟通过" if fixed else "⚠ 自动修复未完全解决,见上方失败点;可手动检查或重 delegate"))
         else:
-            lines.append(f"   ✅ 导入冒烟: {len(smoke)}/{len(smoke)} 模块导入正常")
+            lines.append("   ✅ 组装 + 冒烟通过,可直接 python main.py 运行")
         return "\n".join(lines)
     except Exception as e:
         return f"[link 错误] {e}"
 
 
 # ----------------------------------------------------------------------------
-# 校验 + 自动修复闭环(链接→校验→把错误回灌云端 subagent→重新链接)
+# 校验 + 自动修复闭环(组装→校验→把错误回灌云端 subagent→重新组装)
 # ----------------------------------------------------------------------------
-def _project_modules(out_dir):
-    return [os.path.basename(p) for p in linker.list_modules(out_dir)]
-
-
 def _module_from_traceback(tb_text, module_names):
     """从 traceback 中定位失败所属的项目模块。
     优先用出错帧的文件名;其次扫描 traceback 源码行里出现的 '模块名.'(如 auth.login),
@@ -559,18 +590,21 @@ def _module_from_traceback(tb_text, module_names):
     return None
 
 
-def _map_module_to_subtask(module_basename):
+def _map_module_to_subtask(module_name):
+    if not module_name:
+        return None
+    name = module_name if module_name.endswith(".py") else module_name + ".py"
     for st in SUBTASKS:
         mm = (st.get("manifest", {}).get("module") or "")
-        if mm == module_basename or mm.endswith(module_basename):
+        if mm == name or mm.endswith("/" + name) or mm == module_name:
             return st
     return None
 
 
 def _check_import(out_dir):
-    smoke = linker.import_smoke(out_dir)
-    fails = [{"module": s["module"], "error": s["detail"]} for s in smoke if not s["ok"]]
-    return (len(fails) == 0, fails)
+    # 契约感知冒烟:导入全部模块 + 调用 main 入口(会暴露符号名/签名漂移)
+    ok, failures = smoke.smoke_project(out_dir)
+    return (ok, [{"module": f["module"], "symbol": f["symbol"], "error": f["error"]} for f in failures])
 
 
 def _check_test(out_dir, test_code):
@@ -645,9 +679,18 @@ def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
         log.append(f"   🔧 修复轮次 {rnd}/{rounds}: {len(fails)} 个失败点")
         targets = []
         for f in fails:
-            mod = f.get("module") or _module_from_traceback(f.get("error", ""), module_names)
-            if mod:
-                st = _map_module_to_subtask(mod)
+            # 优先用错误里解析出的精确符号(如 auth.login)定位归属模块;
+            # main.py 入口失败但符号指向 auth.login 时,归属 auth 而非 main。
+            sym = f.get("symbol")
+            owner = None
+            if sym and "." in sym:
+                owner = sym.split(".", 1)[0]
+            elif f.get("module") and f["module"] != "main.py":
+                owner = f["module"][:-3] if f["module"].endswith(".py") else f["module"]
+            if not owner:
+                owner = _module_from_traceback(f.get("error", ""), module_names)
+            if owner:
+                st = _map_module_to_subtask(owner)
                 if st and st not in targets:
                     targets.append(st)
         if not targets and scope:
@@ -662,8 +705,8 @@ def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
         full_err = "\n".join(f.get("error", "") for f in fails)[:3000]
         for st in targets:
             _repair_module(st, full_err)
-        linker.link_project(SUBTASKS, out_dir)  # 用修复后的代码重链
-        log.append("     - 已用修复后的代码重新链接项目")
+        smoke.assemble(out_dir, SUBTASKS, MAIN_CODE)  # 用修复后的代码重新组装
+        log.append("     - 已用修复后的代码重新组装项目")
         ok, fails = check_fn(out_dir)
         if ok:
             log.append(f"   ✅ 第 {rnd} 轮修复后校验通过")
@@ -700,6 +743,7 @@ def verify(project_name: str, test_code: str) -> str:
 
 DISPATCH = {
     "delegate": delegate,
+    "write_main": write_main,
     "link": link,
     "verify": verify,
 }

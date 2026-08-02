@@ -4,7 +4,7 @@
 
 # 仅跟踪需要备份的源码快照
 !ollama_agent.py
-!linker.py
+!smoke.py
 !nvidia-claude-proxy.js
 !CLAUDE.md
 !README.md
