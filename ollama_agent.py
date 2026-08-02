@@ -1122,13 +1122,24 @@ def _code_lines(code):
 
 
 def _norm_module_name(name):
-    """把请求的 name 规范成合法的 .py 文件名(取 basename、补 .py)。"""
+    """把请求的 name 规范成合法的 .py 文件名(取 basename、补 .py、净化非法字符)。
+    模型常把 name 写成带空格/中文的任务标签(如 'config_manager 修复'),若不净化会落盘成
+    'config_manager 修复.py' 这种无法 import 的文件名 → main 用不上、修复白做。
+    净化后 'config_manager 修复' → 'config_manager.py',恰与原模块同名,
+    assemble 覆盖写 = 修复产物真正生效。"""
     if not name:
         return None
     base = os.path.basename(str(name).strip())
     if not base:
         return None
-    return base if base.endswith(".py") else base + ".py"
+    stem = base[:-3] if base.endswith(".py") else base
+    stem = re.sub(r"[^0-9A-Za-z_]", "_", stem)   # 空格/中文/符号 → 下划线
+    stem = re.sub(r"_+", "_", stem).strip("_")
+    if not stem:
+        stem = "module"
+    if stem[0].isdigit():
+        stem = "m_" + stem
+    return stem + ".py"
 
 
 _STDLIB_NAMES = set(getattr(sys, "stdlib_module_names", set()))
@@ -1376,7 +1387,10 @@ def delegate(task: str, tier: str = "flash", name: str = None,
             # 局部小修:把诊断方案并入 repair,循环内修复阶段关思考、照方案改
             repair = dict(repair)
             repair["_diag"] = diag
-    for _ in range(tries):
+    # 至少允许 3 次尝试:空代码/限速等失败需要换模型重试的空间(LOCAL_DELEGATE_TRIES 可能只有 1)
+    _attempt = 0
+    while _attempt < max(tries, 3):
+        _attempt += 1
         model = router.select(tier, exclude=tried)
         t0 = time.perf_counter()
         stop = threading.Event()
@@ -1399,6 +1413,11 @@ def delegate(task: str, tier: str = "flash", name: str = None,
             stop.set(); wp.join(timeout=1)
             router.report(model, latency, None)
             manifest = parse_subagent_output(content)
+            # 空代码 = 本次生成失败(截断到只剩字段/模型没写代码),换模型重试,不当成功入库
+            if not manifest.get("code", "").strip():
+                last_err = f"{model} 返回空代码(0 行),换模型重试"
+                tried.add(model)
+                continue
             # 请求的 name 是权威文件名:模型自作主张改名(如请求 fetch.py 却返回 rouge_fetcher.py)
             # 会导致落盘文件名与 main 的 import 不符 → 孤儿文件 + 编排器重复 delegate 补名。
             # 强制以 name 覆盖 module,一次到位,不再产生孤儿。
@@ -2435,7 +2454,7 @@ def _task_loop(q: str, router, improve_path=None):
     · q / quit / exit     → 退出
     """
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
-    _reset_state(improve_path, reseed=True)
+    # 注意:main() 在进入本循环前已 seed 过 --improve,这里不要重复 seed(否则 SUBTASKS 双份)。
     while True:
         try:
             ans = run_agent(q, history=history)
