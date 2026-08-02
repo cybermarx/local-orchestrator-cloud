@@ -1030,9 +1030,11 @@ def main():
     if DELEGATE_BACKEND == "siliconflow":
         backend_key, backend_flash, backend_pro, backend_name = SILICONFLOW_API_KEY, SILICONFLOW_FLASH, SILICONFLOW_PRO, "SiliconFlow"
         backend_src = "local_config.json" if (SILICONFLOW_API_KEY and not os.environ.get("SILICONFLOW_API_KEY", "").strip()) else ("环境变量" if SILICONFLOW_API_KEY else "无")
+        backend_router = ROUTER_SF
     else:
         backend_key, backend_flash, backend_pro, backend_name = NVIDIA_API_KEY, NVIDIA_FLASH, NVIDIA_PRO, "NVIDIA"
         backend_src = _KEY_SOURCE or "无"
+        backend_router = ROUTER
     print(f"   工具: delegate(云端subagent/{backend_name}) + assemble(组装+冒烟) + verify | 档位: flash={len(backend_flash)} pro={len(backend_pro)}")
     if not backend_key:
         print(f"   ⚠ 未检测到 {backend_name} API key —— delegate 将报错,请先设置对应环境变量或写入 local_config.json")
@@ -1070,7 +1072,7 @@ def main():
             print("\n   ⏹ 已取消当前任务(已完成的子任务仍保留在内存,可继续 assemble 或重新 delegate)")
             continue
         print(f"\n🤖 {ans}")
-        print(f"   [路由器状态] {ROUTER.status_line()}")
+        print(f"   [路由器状态/{backend_name}] {backend_router.status_line()}")
 
 
 if __name__ == "__main__":
