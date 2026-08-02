@@ -69,6 +69,29 @@ NUM_CTX = int(os.environ.get("AGENT_NUM_CTX", "8192"))
 MAX_ITER = int(os.environ.get("AGENT_MAX_ITER", "30"))
 TEMPERATURE = float(os.environ.get("AGENT_TEMP", "0.7"))
 
+# --- 输出预算(截断防护) ---------------------------------------------------
+# num_ctx 是 prompt + 输出「共用」的窗口。不显式给 num_predict 时,历史一涨
+# 输出空间就被挤压,35B 写到一半就被硬截断(尤其 write_main 的 main_code)。
+# 编排器每轮按「剩余窗口」动态计算输出预算,并保底 ORCH_MIN_PREDICT。
+ORCH_MAX_PREDICT = int(os.environ.get("AGENT_ORCH_MAX_PREDICT", "2048"))
+ORCH_MIN_PREDICT = int(os.environ.get("AGENT_ORCH_MIN_PREDICT", "768"))
+CTX_MARGIN = int(os.environ.get("AGENT_CTX_MARGIN", "256"))  # 给模板/特殊 token 留白
+
+# --- 本地 subagent(串行递归:同一个 35B 兼任 subagent) ----------------------
+# 本机通常只常驻一个模型,无法并行(Ollama 默认 OLLAMA_NUM_PARALLEL=1),故串行。
+LOCAL_SUBAGENT_MODEL = os.environ.get("AGENT_LOCAL_SUBAGENT_MODEL", "").strip() or MODEL
+LOCAL_DELEGATE_TRIES = int(os.environ.get("AGENT_LOCAL_TRIES", "2"))  # 本地慢,少重试
+SUB_NUM_CTX = int(os.environ.get("AGENT_SUB_NUM_CTX", "8192"))
+SUB_NUM_PREDICT = int(os.environ.get("AGENT_SUB_NUM_PREDICT", "2560"))
+SUB_TEMPERATURE = float(os.environ.get("AGENT_SUB_TEMP", "0.3"))  # 写代码宜低温,减少退化
+MAX_CONTINUE = int(os.environ.get("AGENT_MAX_CONTINUE", "3"))     # 截断后最多续写几次
+LOCAL_TIMEOUT = int(os.environ.get("AGENT_LOCAL_TIMEOUT", "900"))
+
+# --- 粒度硬约束(低比特量化下,缩短单次输出是保证完整性的主要手段) -----------
+MAX_MODULE_LINES = int(os.environ.get("AGENT_MAX_MODULE_LINES", "60"))
+MAX_MAIN_LINES = int(os.environ.get("AGENT_MAX_MAIN_LINES", "40"))
+MAX_TEST_LINES = int(os.environ.get("AGENT_MAX_TEST_LINES", "20"))
+
 # ----------------------------------------------------------------------------
 # NVIDIA 凭证加载(优先 env,否则回退读取常见 Claude/WorkBuddy config)
 # ----------------------------------------------------------------------------
@@ -264,6 +287,33 @@ ROUTER = ModelRouter(NVIDIA_FLASH, NVIDIA_PRO)
 ROUTER_SF = ModelRouter(SILICONFLOW_FLASH, SILICONFLOW_PRO)
 
 
+class LocalRouter:
+    """本地单模型「路由器」:接口与 ModelRouter 对齐,但只有一个候选。
+    本机通常只常驻一个模型(Ollama 默认不并行),所以无从路由——串行递归即由此而来。"""
+
+    def __init__(self, model):
+        self.model = model
+        self.calls = 0
+        self.fails = 0
+        self.ema = 0.0
+
+    def select(self, tier="flash", exclude=None):
+        return self.model  # 唯一候选:失败也只能重试它(本地失败多为截断,重试有效)
+
+    def report(self, model, latency, err=None):
+        self.calls += 1
+        if err:
+            self.fails += 1
+        self.ema = latency if self.calls == 1 else 0.7 * self.ema + 0.3 * latency
+
+    def status_line(self):
+        return (f"{self.model} | 调用={self.calls} 失败={self.fails} "
+                f"平均={self.ema:.1f}s (本地串行)")
+
+
+ROUTER_LOCAL = LocalRouter(LOCAL_SUBAGENT_MODEL)
+
+
 SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提供算力的「任务编排器」。
 你掌握用户的**总目标**,但你派出去的每一个云端 subagent 都**只知道自己的子目标**,不知道总目标——这是刻意的信息隔离,让每个 subagent 专注于自己的子任务、互不串扰。
 
@@ -271,19 +321,26 @@ SYSTEM_PROMPT = """你是一个运行在用户本机、由 Ollama(本地35B)提�
 - delegate(task, tier?, name?, provides?, depends_on?): 把一个子任务的**子目标**派给云端 subagent 完成。返回简短指针——真实成果存入「侧边存储」,不占对话上下文。
 - write_main(project_name, main_code): 你(编排器,掌握总目标)亲自写**主函数 main.py(组合根)**。它 import 各模块、按你设计的契约调用它们,把整个项目串起来。main.py 必须严格按 provides/depends_on 约定的**名字与签名**调用各模块符号——这是「去 linker」设计下唯一需要你保证接口一致的地方(同目录放文件即可,import 会自行接线)。这里只暂存代码,落盘由 assemble 统一做。
 - assemble(project_name): 所有模块 delegate 完成、且你已 write_main 后调用。它把所有模块文件 + main.py 落到同一目录(无需接线,Python import 即 linker),然后做「导入全部模块 + 真正调用 main 入口」的契约感知冒烟;对冒烟失败(符号名/签名漂移、缺失模块、循环依赖)自动启动修复闭环,返回项目树。
-- verify(project_name, test_code): 【可选】assemble 后,用一个 Python 片段对生成的项目做**集成校验**(你掌握总目标,应写出能验证核心流程的断言,如 register 后 login 能拿到 token)。失败会自动回灌云端 subagent 修复并重新组装。
+- verify(project_name, test_code, name?): 【可选】assemble 后,用一个**短**Python 片段对生成的项目做**一片**集成校验(你掌握总目标,应写出能验证核心流程的断言,如 register 后 login 能拿到 token)。失败会自动回灌 subagent 修复并重新组装。**校验要分片**:一次只验一个切面,分多次调用,用 name 标注这片验什么。
 
 工作方式(契约优先,去 linker):
 1. 理解用户的**总目标**;
-2. 先做**模块契约设计**(这是唯一需要总目标的地方):把项目拆成若干模块,为每个模块确定
+2. 先做**模块契约设计**(这是唯一需要总目标的地方):把项目拆成若干**小**模块(见下方「输出长度纪律」),为每个模块确定
    - module: 文件名
    - provides: 它必须对外暴露的符号列表(函数/类名,尽量带签名,如 "get_user(id) -> User")
    - depends_on: 它**实际会调用**的其它模块符号——**既要列读依赖,也要列写依赖**(例如注册模块既要依赖 "user_db:authenticate" 也要依赖 "user_db:create_user",因为注册必须把用户写进库)。格式 "模块:符号(签名)"。
    契约是 subagent 之间对接的**唯一依据**,务必让 provides 与 depends_on 互相吻合(谁提供、谁消费要一致;尤其注意写流程的两端都要连上)。
 3. 逐个 delegate:每次只把**该模块的「子目标」+「契约」**(必提供的符号/签名、可依赖的符号/签名)传给 subagent。**绝不要把总目标写进 subagent 的提示**——subagent 只该看到自己的子目标与契约。
 4. 你亲自写 main.py:基于上面设计的契约,import 各模块、按约定名字/签名调用它们,串成完整流程。用 write_main 暂存(务必让 import 名与 provides 完全一致)。
-5. 调用 assemble 组装(会自动冒烟与修复);若任务有明显 happy-path,再调用 verify 跑一个集成断言,让系统把逻辑错误也自动修掉。若 assemble/verify 报告「缺失模块 X」或「No module named X」,说明 X 从未被 delegate——你必须在下一轮用 delegate 创建 X 模块(给出子目标与契约),然后再次 assemble,直到不再有缺失模块。
+5. 调用 assemble 组装(会自动冒烟与修复);若任务有明显 happy-path,再**分多次**调用 verify,每次跑一小片集成断言,让系统把逻辑错误也自动修掉。若 assemble/verify 报告「缺失模块 X」或「No module named X」,说明 X 从未被 delegate——你必须在下一轮用 delegate 创建 X 模块(给出子目标与契约),然后再次 assemble,直到不再有缺失模块。
 6. 简单聊天可直接回答,不必 delegate。
+
+**输出长度纪律(硬约束,必须遵守)**:
+你和 subagent 可能都跑在本机的低比特量化模型上,**单次输出越长,被截断成半截代码的概率越高**。所以:
+- **每个模块**:单一职责、只暴露 1-3 个符号、目标 ≤%MAXMOD% 行。宁可多拆 3 个小模块,也绝不要 1 个大模块。若发现某个子目标要写很多代码,先把它再拆开。
+- **main.py**:只做「import 各模块 + 按契约把流程串起来」,目标 ≤%MAXMAIN% 行。**任何实际逻辑都要下沉成新模块 delegate 出去**,不要写在 main.py 里。
+- **verify**:不要写一个大测试。每次只验**一个切面**(≤%MAXTEST% 行),分多次调用并用 name 标注(如 "注册流程"、"登录流程")。
+- 若工具返回里出现「⚠ …被截断 / 语法错误 / 超过上限行」,说明**这一块太大了**:把它拆成更小的子目标重新 delegate,不要原样重试。
 
 规则:
 - delegate 的 task 就是该模块的「子目标」,要自包含、清晰。
@@ -313,8 +370,15 @@ SUBAGENT_SYS = """你是一个代码 subagent。你只负责完成分配给你�
 - code 必须定义 provides 中列出的每一个符号,且签名一致。
 - code 只可使用 depends_on 中列出的外部符号(其它一律当不存在),不要去"猜"或"协调"其它子任务。
 - code 必须是自洽、可独立存在的完整文件内容。
+- **务必简短**:目标 ≤%MAXMOD% 行(不含空行)。只实现 provides 要求的符号,**不要**添加额外功能、不要写长篇 docstring、不要写逐行注释、不要写 `if __name__ == "__main__"` 演示块、不要写自测代码。输出越长越可能被截断成半截代码——宁可写得紧凑,也不能写不完。
 - 只输出 JSON。
 """
+
+# 粒度上限注入 prompt(两段 prompt 都含字面花括号,不能用 f-string,故用占位符替换)
+for _ph, _v in (("%MAXMOD%", MAX_MODULE_LINES), ("%MAXMAIN%", MAX_MAIN_LINES),
+                ("%MAXTEST%", MAX_TEST_LINES)):
+    SYSTEM_PROMPT = SYSTEM_PROMPT.replace(_ph, str(_v))
+    SUBAGENT_SYS = SUBAGENT_SYS.replace(_ph, str(_v))
 
 
 # ----------------------------------------------------------------------------
@@ -329,7 +393,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "该模块的「子目标」:清晰、自包含、只描述本模块要做什么(不要写入总目标)"},
+                    "task": {"type": "string", "description": "该模块的「子目标」:清晰、自包含、只描述本模块要做什么(不要写入总目标)。务必足够小——单一职责、只暴露 1-3 个符号,代码目标 60 行内,过大会被截断"},
                     "tier": {"type": "string", "enum": ["flash", "pro"], "description": "模型档位:flash=快/便宜,pro=强/慢。默认 flash"},
                     "name": {"type": "string", "description": "可选的子任务名/编号,便于后续引用"},
                     "provides": {"type": "array", "items": {"type": "string"}, "description": "本模块必须对外暴露的符号契约,如 ['get_user(id) -> User'];subagent 须严格按此实现。总目标不传于此。"},
@@ -348,7 +412,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "project_name": {"type": "string", "description": "项目目录名(须与后续 assemble 一致)"},
-                    "main_code": {"type": "string", "description": "完整的 main.py 源码字符串(须定义 def main(): 且 if __name__=='__main__': main())"},
+                    "main_code": {"type": "string", "description": "完整的 main.py 源码字符串(须定义 def main(): 且 if __name__=='__main__': main())。只做 import + 流程编排,目标 40 行内;逻辑一律下沉成模块 delegate 出去,写长了会被截断"},
                 },
                 "required": ["project_name", "main_code"],
             },
@@ -372,12 +436,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "verify",
-            "description": "对已 assemble 的项目做集成校验:你(编排器,掌握总目标)写一个 Python 片段导入生成模块并对核心流程断言(如 register 后 login 能拿到 token)。校验失败会自动把报错回灌给对应云端 subagent 修复并重新组装,直到通过或达到最大轮次。",
+            "description": "对已 assemble 的项目做【一片】集成校验:写一个简短 Python 片段导入生成模块并对某一个核心流程断言(如 register 后 login 能拿到 token)。校验失败会自动把报错回灌给 subagent 修复并重新组装。请分多次调用,每次只验一个切面——一次写太长会被输出上限截断,而截断的测试会被误判成项目 bug。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "project_name": {"type": "string", "description": "项目目录名(须已 assemble)"},
-                    "test_code": {"type": "string", "description": "集成校验用的 Python 代码字符串(导入项目模块并做断言;项目目录已在 sys.path)"},
+                    "test_code": {"type": "string", "description": "本片校验的 Python 代码(导入项目模块并断言;项目目录已在 sys.path)。只验一个切面,目标 20 行内"},
+                    "name": {"type": "string", "description": "本片校验的名字,如 '注册流程'、'登录流程',便于区分多次调用"},
                 },
                 "required": ["project_name", "test_code"],
             },
@@ -429,33 +494,100 @@ def siliconflow_chat(model, messages, timeout=DELEGATE_TIMEOUT, use_json=True):
     return _openai_chat(SILICONFLOW_API_KEY, SILICONFLOW_BASE_URL, "SiliconFlow", model, messages, timeout, use_json)
 
 
+def _decode_json_string_prefix(s, start):
+    """从 s[start](起始引号之后)解码 JSON 字符串内容,遇未转义 `"` 结束。
+    字符串因截断而未闭合时,返回已解出的部分与 None。返回 (value, end_index_or_None)。"""
+    out, i, n = [], start, len(s)
+    esc = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f",
+           "n": "\n", "r": "\r", "t": "\t"}
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            if i + 1 >= n:
+                break
+            e = s[i + 1]
+            if e in esc:
+                out.append(esc[e]); i += 2; continue
+            if e == "u":
+                h = s[i + 2:i + 6]
+                if len(h) == 4:
+                    try:
+                        out.append(chr(int(h, 16))); i += 6; continue
+                    except ValueError:
+                        pass
+                break
+            out.append(e); i += 2; continue
+        if c == '"':
+            return "".join(out), i
+        out.append(c); i += 1
+    return "".join(out), None
+
+
+def _salvage_truncated_json(t):
+    """从被截断/残缺的 JSON 中抢救字段(低比特本地模型的常见故障)。
+    code 通常是最后一个字段,截断就发生在它中间——逐字段解码可救回大部分源码。
+    返回 dict(含 _truncated 标记)或 None。"""
+    m_code = re.search(r'"code"\s*:\s*"', t)
+    if not m_code:
+        return None
+    code, end = _decode_json_string_prefix(t, m_code.end())
+    if not code.strip():
+        return None
+    obj = {"code": code, "_truncated": end is None}
+    for key in ("module", "language", "summary"):
+        m = re.search(r'"%s"\s*:\s*"' % key, t)
+        if m:
+            val, _ = _decode_json_string_prefix(t, m.end())
+            obj[key] = val
+    for key in ("provides", "depends_on"):
+        m = re.search(r'"%s"\s*:\s*\[' % key, t)
+        if m:
+            seg = t[m.end():]
+            close = seg.find("]")
+            obj[key] = re.findall(r'"((?:[^"\\]|\\.)*)"', seg if close < 0 else seg[:close])
+    return obj
+
+
 def parse_subagent_output(text):
     if not text:
-        return {"module": "module.py", "code": "", "provides": [], "depends_on": [], "summary": ""}
+        return {"module": "module.py", "code": "", "provides": [], "depends_on": [],
+                "summary": "", "truncated": False}
     t = text.strip()
     if t.startswith("```"):
         t = re.sub(r"^```[a-zA-Z]*\n?", "", t)
         t = re.sub(r"\n?```$", "", t).strip()
+    truncated = False
     try:
         obj = json.loads(t)
     except Exception:
         m = re.search(r"\{.*\}", t, re.S)
+        obj = {}
         if m:
             try:
                 obj = json.loads(m.group(0))
             except Exception:
                 obj = {}
-        else:
-            obj = {}
+        if not obj:
+            # JSON 解析失败:多半是被截断。逐字段抢救,避免把整段原始文本当成代码落盘。
+            salvaged = _salvage_truncated_json(t)
+            if salvaged:
+                truncated = salvaged.pop("_truncated", False)
+                obj = salvaged
     if not isinstance(obj, dict):
         obj = {}
+    code = obj.get("code", "")
+    if not code:
+        # 连 JSON 都没有:尝试从 ```python``` 代码块里取,再退回原文
+        m = re.search(r"```(?:python)?\s*\n(.*?)(?:\n```|\Z)", t, re.S)
+        code = m.group(1) if m else t
     return {
         "module": obj.get("module") or "module.py",
         "language": obj.get("language", "python"),
         "provides": obj.get("provides") or [],
         "depends_on": obj.get("depends_on") or [],
         "summary": obj.get("summary", ""),
-        "code": obj.get("code", "") or t,
+        "code": code,
+        "truncated": truncated,
     }
 
 
@@ -513,6 +645,31 @@ def _wait_printer(stop, model, label, interval=20):
         print(f"   ⌛ 仍在等待 {model} 生成子任务'{label}'… 已 {waited}s", flush=True)
 
 
+def _code_lines(code):
+    return len([ln for ln in (code or "").splitlines() if ln.strip()])
+
+
+def _grain_warning(manifest):
+    """粒度 / 完整性体检。语法错误是「被截断」最确定的信号——低比特量化下,
+    与其让半截代码流进 assemble 再去猜,不如当场告诉编排器:拆得更小、重来。"""
+    notes = []
+    code = manifest.get("code", "") or ""
+    if manifest.get("truncated"):
+        notes.append("输出被截断(已从残缺 JSON 抢救,可能不完整)")
+    n = _code_lines(code)
+    if n > MAX_MODULE_LINES:
+        notes.append(f"模块 {n} 行 > 上限 {MAX_MODULE_LINES} 行,截断风险高,"
+                     f"建议拆成 2 个以上更小模块重新 delegate")
+    try:
+        compile(code, manifest.get("module", "m.py"), "exec")
+    except SyntaxError as e:
+        notes.append(f"代码语法错误(第 {e.lineno} 行: {e.msg}),典型截断特征,"
+                     f"请用更小的子目标重新 delegate")
+    except Exception:
+        pass
+    return (" | ⚠ " + " ; ".join(notes)) if notes else ""
+
+
 def delegate(task: str, tier: str = "flash", name: str = None,
              provides: list = None, depends_on: list = None,
              repair: dict = None, replace_id: int = None) -> str:
@@ -522,17 +679,22 @@ def delegate(task: str, tier: str = "flash", name: str = None,
     replace_id: 指定则原地更新该 SUBTASKS 条目(用于修复),否则追加新条目。
     单轮内若某模型超时/失败会切换到下一个候选,避免反复卡在同一个过载模型上。"""
     backend = DELEGATE_BACKEND
-    if backend == "siliconflow":
+    if backend == "ollama":
+        router, chat_fn = ROUTER_LOCAL, ollama_subagent_chat
+        tries, tmo = LOCAL_DELEGATE_TRIES, LOCAL_TIMEOUT
+    elif backend == "siliconflow":
         router, chat_fn = ROUTER_SF, siliconflow_chat
+        tries, tmo = MAX_DELEGATE_TRIES, DELEGATE_TIMEOUT
     else:
         router, chat_fn = ROUTER, nvidia_chat
+        tries, tmo = MAX_DELEGATE_TRIES, DELEGATE_TIMEOUT
     last_err = "未知错误"
     contract = None
     if provides or depends_on:
         contract = {"provides": provides or [], "depends_on": depends_on or []}
     tried = set()  # 本轮回避:同一模型本轮不再重试
     label = name or task[:14]
-    for _ in range(MAX_DELEGATE_TRIES):
+    for _ in range(tries):
         model = router.select(tier, exclude=tried)
         t0 = time.perf_counter()
         stop = threading.Event()
@@ -541,11 +703,12 @@ def delegate(task: str, tier: str = "flash", name: str = None,
             print(f"   ⌛ 调用 {model} 生成子任务'{label}'…", flush=True)
             wp.start()
             msgs = subagent_repair_messages(repair, contract) if repair else subagent_messages(task, contract)
-            content = chat_fn(model, msgs, timeout=DELEGATE_TIMEOUT)
+            content = chat_fn(model, msgs, timeout=tmo)
             latency = time.perf_counter() - t0
             stop.set(); wp.join(timeout=1)
             router.report(model, latency, None)
             manifest = parse_subagent_output(content)
+            warn = _grain_warning(manifest)
             if replace_id is not None:
                 for st in SUBTASKS:
                     if st.get("id") == replace_id:
@@ -555,7 +718,7 @@ def delegate(task: str, tier: str = "flash", name: str = None,
                         st["latency"] = round(latency, 1)
                         tag = f"[{name}] " if name else ""
                         return (f"{tag}子任务#{replace_id} 修复完成 | model={model} ({latency:.1f}s) | "
-                                f"module={manifest['module']} | 已更新侧边存储")
+                                f"module={manifest['module']} | 已更新侧边存储{warn}")
             sid = len(SUBTASKS) + 1
             SUBTASKS.append({
                 "id": sid,
@@ -569,7 +732,7 @@ def delegate(task: str, tier: str = "flash", name: str = None,
             tag = f"[{name}] " if name else ""
             return (f"{tag}子任务#{sid} 完成 | model={model} ({latency:.1f}s) | "
                     f"module={manifest['module']} | provides={manifest['provides']} | "
-                    f"已存入侧边存储(不占上下文)")
+                    f"{_code_lines(manifest.get('code'))}行 | 已存入侧边存储(不占上下文){warn}")
         except Nvidia429 as e:
             stop.set(); wp.join(timeout=1)
             latency = time.perf_counter() - t0
@@ -622,12 +785,25 @@ def write_main(project_name: str, main_code: str) -> str:
             "tier": "pro",
             "latency": None,
         })
+    notes = []
+    # 组合根由编排器在「工具参数」里输出,是最容易被输出上限截断的地方——当场体检。
+    try:
+        compile(MAIN_CODE, "main.py", "exec")
+    except SyntaxError as e:
+        notes.append(f"语法错误(第 {e.lineno} 行: {e.msg})。这几乎必然是输出被截断——"
+                     f"请把 main.py 写得更短(只做 import 与流程编排,把逻辑下沉到模块)后重发")
     if "def main(" not in MAIN_CODE:
-        return ("[write_main] 已暂存,但警告:main_code 未定义 def main(),"
-                "smoke 将报『main.py 未定义 main() 入口』。建议补上 def main(): 与"
-                " if __name__ == '__main__': main()。")
-    return ("[write_main] 已暂存 main.py(组合根)并注册为可修复条目。调用 assemble 即可与所有"
-            "子任务模块组装到同一目录并做契约感知冒烟；组装失败时组合根可被自动重写修复。")
+        notes.append("未定义 def main(),smoke 将报『main.py 未定义 main() 入口』;"
+                     "请补上 def main(): 与 if __name__ == '__main__': main()")
+    n = _code_lines(MAIN_CODE)
+    if n > MAX_MAIN_LINES:
+        notes.append(f"{n} 行 > 组合根上限 {MAX_MAIN_LINES} 行。main.py 应当只做"
+                     f"「import 各模块 + 按契约串流程」,任何实际逻辑都该 delegate 成新模块")
+    head = f"[write_main] 已暂存 main.py({n} 行)并注册为可修复条目。"
+    if notes:
+        return head + " ⚠ " + " ; ".join(notes)
+    return (head + "调用 assemble 即可与所有子任务模块组装到同一目录并做契约感知冒烟；"
+            "组装失败时组合根可被自动重写修复。")
 
 
 def assemble(project_name: str) -> str:
@@ -869,17 +1045,34 @@ def repair_loop(out_dir, check_fn, rounds=REPAIR_ROUNDS, scope=None):
     return log, ok, missing
 
 
-def verify(project_name: str, test_code: str) -> str:
+def verify(project_name: str, test_code: str, name: str = None) -> str:
+    """对已 assemble 的项目做一「片」集成校验。
+    分片语义:每次只验一个切面(建议 ≤MAX_TEST_LINES 行),可多次调用。
+    这不只是为了定位精度——test_code 由编排器自己生成,写长了同样会被输出上限截断,
+    而截断的测试是语法错误,会被误判成「项目有 bug」,触发一整轮无谓修复。"""
     if not SUBTASKS:
         return "[verify] 侧边存储为空,请先 delegate 并 assemble。"
     out_dir = os.path.join(PROJECT_DIR, project_name or "project")
     if not os.path.isdir(out_dir):
         return f"[verify] 项目目录不存在: {out_dir},请先 assemble。"
+    tag = f"[{name}] " if name else ""
+    # 关键:先体检测试代码本身。语法不通 = 测试被截断,而非项目有问题——
+    # 此时绝不能进入修复闭环去「修」一个其实没坏的项目。
+    try:
+        compile(test_code or "", "test_smoke.py", "exec")
+    except SyntaxError as e:
+        return (f"{tag}[verify 未执行] 你提供的 test_code 语法错误"
+                f"(第 {e.lineno} 行: {e.msg})——这通常是输出被截断。"
+                f"请把校验拆成更小的分片(每片 ≤{MAX_TEST_LINES} 行、只验一个切面),"
+                f"分多次调用 verify,不要一次写一个大测试。")
+    n = _code_lines(test_code)
+    over = (f" ⚠ 本片 {n} 行 > 建议上限 {MAX_TEST_LINES} 行,下次请拆更细"
+            if n > MAX_TEST_LINES else "")
     try:
         ok, fails = _check_test(out_dir, test_code)
         if ok:
-            return f"✅ 集成校验通过(项目: {project_name})"
-        lines = [f"⚠ 集成校验失败,启动自动修复闭环(项目: {project_name})"]
+            return f"{tag}✅ 集成校验通过({n} 行 | 项目: {project_name}){over}"
+        lines = [f"{tag}⚠ 集成校验失败,启动自动修复闭环(项目: {project_name}){over}"]
         # 集成测试的 traceback 通常不点名模块,改用测试 import 的模块作为修复范围。
         # scope 统一存成 manifest 里的文件名(如 auth.py),与失败点/映射函数的口径一致。
         scope = set()
@@ -942,7 +1135,7 @@ def history_tokens(messages: list) -> int:
 # ----------------------------------------------------------------------------
 # Ollama 通信(原生 /api/chat)
 # ----------------------------------------------------------------------------
-def _ollama_raw(payload: dict) -> dict:
+def _ollama_raw(payload: dict, timeout: int = 600) -> dict:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         f"{OLLAMA_URL}/api/chat",
@@ -950,12 +1143,29 @@ def _ollama_raw(payload: dict) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _output_budget(messages: list) -> int:
+    """按「剩余上下文窗口」算本轮可用的输出预算。
+    num_ctx 是 prompt+输出共用的:不显式限制时,历史一涨输出就被硬截断
+    (write_main 的 main_code 断在半截就是这么来的)。"""
+    used = history_tokens(messages)
+    room = NUM_CTX - used - CTX_MARGIN
+    if room < ORCH_MIN_PREDICT:
+        print(f"   ⚠ 输出预算仅剩 ~{max(room, 0)} token(< {ORCH_MIN_PREDICT}),"
+              f"生成极易被截断;建议降低 AGENT_BUDGET 触发压缩或调大 AGENT_NUM_CTX", flush=True)
+        return max(room, ORCH_MIN_PREDICT)  # 仍给保底,宁可溢出也不要生成半截
+    return min(ORCH_MAX_PREDICT, room)
+
+
 def _ollama_chat(messages: list, force_no_think: bool = False) -> dict:
-    opts = {"num_ctx": NUM_CTX, "temperature": TEMPERATURE}
+    opts = {
+        "num_ctx": NUM_CTX,
+        "temperature": TEMPERATURE,
+        "num_predict": _output_budget(messages),
+    }
     if force_no_think or not ENABLE_THINKING:
         opts["enable_thinking"] = False
     payload = {
@@ -965,7 +1175,69 @@ def _ollama_chat(messages: list, force_no_think: bool = False) -> dict:
         "options": opts,
         "stream": False,
     }
-    return _ollama_raw(payload)
+    resp = _ollama_raw(payload)
+    if resp.get("done_reason") == "length":
+        print("   ⚠ 编排器本轮输出被长度上限截断(工具参数可能不完整)。"
+              "请让它把模块/主函数拆得更小,或调大 AGENT_NUM_CTX", flush=True)
+    return resp
+
+
+# ----------------------------------------------------------------------------
+# 本地 subagent(串行递归:同一个 35B 兼任 subagent)
+#   低比特量化(如 IQ2_M)下长输出极易退化/截断,故:
+#   ① 显式 num_predict,把窗口留给输出;② 检测 done_reason=="length";
+#   ③ 用 assistant prefill 续写,并按重叠去重拼接。
+# ----------------------------------------------------------------------------
+def _stitch(acc: str, nxt: str) -> str:
+    """拼接续写结果:模型常会重复尾部若干字符,取最长重叠去重,避免代码被写重。"""
+    if not acc:
+        return nxt
+    if not nxt:
+        return acc
+    # 取「最长」重叠:从大到小扫,首个命中即最长。下限 12 字符——再低容易被
+    # "\n        " 这类缩进串误判成重叠而吃掉真代码,再高则漏掉真实的短重复。
+    max_ov = min(len(acc), len(nxt), 400)
+    for n in range(max_ov, 11, -1):
+        if acc[-n:] == nxt[:n]:
+            return acc + nxt[n:]
+    return acc + nxt
+
+
+def _ollama_complete(model, messages, num_ctx, num_predict, temperature, timeout):
+    payload = {
+        "model": model,
+        "messages": messages,
+        "options": {"num_ctx": num_ctx, "temperature": temperature,
+                    "num_predict": num_predict, "enable_thinking": False},
+        "stream": False,
+    }
+    resp = _ollama_raw(payload, timeout=timeout)
+    return (resp.get("message", {}) or {}).get("content", "") or "", resp.get("done_reason", "")
+
+
+def ollama_subagent_chat(model, messages, timeout=None, use_json=True):
+    """本地 35B 兼任 subagent(串行递归)。截断则自动 prefill 续写,最多 MAX_CONTINUE 次。
+    签名与 nvidia_chat / siliconflow_chat 保持一致,便于 delegate 统一调度。"""
+    timeout = timeout or LOCAL_TIMEOUT
+    acc, reason = "", ""
+    for attempt in range(MAX_CONTINUE + 1):
+        # 已有内容时把它作为 assistant prefill,让模型「接着写」而不是重新开始
+        msgs = list(messages) + ([{"role": "assistant", "content": acc}] if acc else [])
+        content, reason = _ollama_complete(
+            model, msgs, SUB_NUM_CTX, SUB_NUM_PREDICT, SUB_TEMPERATURE, timeout)
+        if not content.strip():
+            break
+        acc = _stitch(acc, content)
+        if reason != "length":
+            break
+        if attempt < MAX_CONTINUE:
+            print(f"   ↻ 输出被截断,续写第 {attempt + 1}/{MAX_CONTINUE} 次"
+                  f"(已 {len(acc)} 字符)…", flush=True)
+    if reason == "length":
+        print(f"   ⚠ 续写 {MAX_CONTINUE} 次后仍未收尾,将尝试从残缺 JSON 中抢救代码", flush=True)
+    if not acc.strip():
+        raise RuntimeError("本地 subagent 返回空内容")
+    return acc
 
 
 def _dispatch_tool(tc: dict) -> str:
@@ -1128,12 +1400,37 @@ def run_agent(query: str, history: list = None) -> str:
 # CLI
 # ----------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(description="本地编排器 + 云端 subagent + 本地链接器")
+    global DELEGATE_BACKEND
+    parser = argparse.ArgumentParser(description="本地编排器 + subagent(云端或本地) + 契约感知组装")
     parser.add_argument("query", nargs="*", help="单次任务（不填则进入交互模式）")
+    parser.add_argument("--local", action="store_true",
+                        help="全本地模式:subagent 也用本地 Ollama(串行递归),完全不联网")
     args = parser.parse_args()
+    if args.local:
+        DELEGATE_BACKEND = "ollama"
 
     print(f"🦙 本地编排器 | 模型={MODEL} | num_ctx={NUM_CTX} | Ollama={OLLAMA_URL}")
     print(f"   compact: mode={SUMMARY_MODE if USE_SUMMARY else 'off'} | thinking={'on' if ENABLE_THINKING else 'off'} | 预算={BUDGET} token")
+    print(f"   输出预算: 编排器≤{ORCH_MAX_PREDICT} / subagent≤{SUB_NUM_PREDICT} token"
+          f" | 截断自动续写×{MAX_CONTINUE}"
+          f" | 粒度上限: 模块{MAX_MODULE_LINES}行 main{MAX_MAIN_LINES}行 测试{MAX_TEST_LINES}行")
+    if DELEGATE_BACKEND == "ollama":
+        print(f"   工具: delegate(本地subagent/串行递归 · {LOCAL_SUBAGENT_MODEL})"
+              f" + assemble(组装+冒烟) + verify(分片校验)")
+        print(f"   🔒 全本地模式:不联网,编排器与 subagent 共用同一个本地模型,串行执行")
+        if args.query:
+            q = " ".join(args.query)
+            print(f"\n👤 {q}")
+            try:
+                ans = run_agent(q)
+            except KeyboardInterrupt:
+                print("\n   ⏹ 已取消")
+                return
+            print(f"\n🤖 {ans}")
+            print(f"   [路由器状态/本地] {ROUTER_LOCAL.status_line()}")
+            return
+        _interactive(ROUTER_LOCAL, "本地")
+        return
     if DELEGATE_BACKEND == "siliconflow":
         backend_key, backend_flash, backend_pro, backend_name = SILICONFLOW_API_KEY, SILICONFLOW_FLASH, SILICONFLOW_PRO, "SiliconFlow"
         backend_src = "local_config.json" if (SILICONFLOW_API_KEY and not os.environ.get("SILICONFLOW_API_KEY", "").strip()) else ("环境变量" if SILICONFLOW_API_KEY else "无")
@@ -1160,6 +1457,10 @@ def main():
         print(f"\n🤖 {ans}")
         return
 
+    _interactive(backend_router, backend_name)
+
+
+def _interactive(backend_router, backend_name):
     history = [{"role": "system", "content": SYSTEM_PROMPT}]
     print("\n交互模式（输入 exit / quit / 按 Ctrl-C 退出）\n")
     while True:
