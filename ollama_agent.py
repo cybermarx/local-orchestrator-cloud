@@ -2286,6 +2286,8 @@ def run_agent(query: str, history: list = None) -> str:
         try:
             resp = _ollama_chat(messages)
         except urllib.error.URLError as e:
+            if history is not None:      # 错误路径也回写,供『继续』断点续跑
+                history[:] = messages
             return f"[无法连接 Ollama] 确认 Ollama 已启动且监听 {OLLAMA_URL}：{e}"
 
         msg = resp.get("message", {})
@@ -2301,6 +2303,8 @@ def run_agent(query: str, history: list = None) -> str:
                     pass
 
         if "error" in resp:
+            if history is not None:      # 错误路径也回写,供『继续』断点续跑
+                history[:] = messages
             return f"[Ollama 错误] {resp['error']}"
 
         if msg.get("tool_calls"):
@@ -2359,6 +2363,10 @@ _MANUAL = """\
   构建完成后,把项目目录传给 --fix-project(等价于 --improve 目录 + 内置"检查并修复常见错误"提示词),
   再带上 --local,让同一个 35B 对成品做一轮质量巡检与修复;也可用 query 自定义本次巡检要求。
 
+任务结束后的交互(带参数启动也生效):
+  单次任务跑完或中断(Ollama 500/断网)后【不会直接退出】:输入 回车/继续 断点续跑(无进展则干净重试),
+  或直接输入新指令换任务,q 退出。
+
 内置巡检项(fix_common_errors_prompt):
   先读后改 / 孤儿文件 / 影子模块(遮蔽标准库与第三方库) / 重复模块 / 契约错配(签名与返回形状) /
   静默吞异常返回假数据 / 未接线死代码 / 相对导入 / verify 真实断言防作弊。
@@ -2368,6 +2376,66 @@ _MANUAL = """\
   AGENT_BUDGET 压缩触发预算  AGENT_CONTRACT_CHECK 契约校验开关  AGENT_GUARD_SHADOW 影子模块告警
   AGENT_MAX_ORCH_DEPTH 分层子编排器深度上限(默认2)
 """
+
+
+def _reset_state(improve_path=None, reseed=True):
+    """清空侧边存储与组合根;reseed 时重新载入 --improve 的已有代码(供『继续/新任务』用)。"""
+    global SUBTASKS, MAIN_CODE
+    SUBTASKS = []
+    MAIN_CODE = ""
+    if reseed and improve_path:
+        _seed_existing_code(improve_path)
+
+
+def _no_progress(history):
+    """上次运行是否一步都没走出去(只有 system+user,没有 assistant/tool 进展)。
+    True → 『继续』应干净重试同一任务;False → 断点续跑上一轮对话。"""
+    if len(history) <= 2:
+        return True
+    return not any(m.get("role") in ("assistant", "tool") for m in history[1:])
+
+
+def _task_loop(q: str, router, improve_path=None):
+    """带参数启动的任务执行器:跑完/跑崩后【不直接退出】,进入可续跑交互循环。
+    · 回车 / 继续 / go on  → 上次运行尚无进展则干净重试同一任务;否则断点续跑(复用 history)
+    · 新任务 / 换任务      → 清空状态后输入新指令执行
+    · q / quit / exit     → 退出
+    """
+    history = [{"role": "system", "content": SYSTEM_PROMPT}]
+    _reset_state(improve_path, reseed=True)
+    while True:
+        try:
+            ans = run_agent(q, history=history)
+            print(f"\n🤖 {ans}")
+        except KeyboardInterrupt:
+            print("\n   ⏹ 已取消")
+            return
+        except Exception as e:
+            print(f"\n   ⚠ 运行中断: {type(e).__name__}: {e}")
+        if router is not None:
+            print(f"   [路由器状态/本地] {router.status_line()}")
+        try:
+            inp = input("\n[任务结束] 回车/继续=续跑 · 新任务=输新指令 · q=退出\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n   ⏹ 已退出")
+            return
+        low = inp.lower()
+        if low in ("q", "quit", "exit", "退出"):
+            return
+        if low in ("", "继续", "go on", "go", "continue", "重试", "retry"):
+            if _no_progress(history):
+                history[:] = [{"role": "system", "content": SYSTEM_PROMPT}]
+                _reset_state(improve_path, reseed=True)
+                print("   ↻ 上次运行尚无进展,干净重试同一任务…")
+            else:
+                q = "继续（接着上一轮的进度继续执行,不要从头重新规划）"
+                print("   ↻ 断点续跑(继续上一轮对话)…")
+            continue
+        # 其它输入视为新任务
+        _reset_state(improve_path, reseed=True)
+        history[:] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        q = inp
+        print(f"\n👤 {q}")
 
 
 def main():
@@ -2430,13 +2498,7 @@ def main():
         if args.query:
             q = " ".join(args.query)
             print(f"\n👤 {q}")
-            try:
-                ans = run_agent(q)
-            except KeyboardInterrupt:
-                print("\n   ⏹ 已取消")
-                return
-            print(f"\n🤖 {ans}")
-            print(f"   [路由器状态/本地] {ROUTER_LOCAL.status_line()}")
+            _task_loop(q, ROUTER_LOCAL, args.improve)
             return
         _interactive(ROUTER_LOCAL, "本地")
         return
@@ -2458,12 +2520,7 @@ def main():
     if args.query:
         q = " ".join(args.query)
         print(f"\n👤 {q}")
-        try:
-            ans = run_agent(q)
-        except KeyboardInterrupt:
-            print("\n   ⏹ 已取消")
-            return
-        print(f"\n🤖 {ans}")
+        _task_loop(q, backend_router, args.improve)
         return
 
     _interactive(backend_router, backend_name)
