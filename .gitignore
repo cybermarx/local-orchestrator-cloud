@@ -7,6 +7,7 @@
 !ollama_agent.cmd
 !smoke.py
 !nvidia-claude-proxy.js
+!free-claude-proxy.js
 !CLAUDE.md
 !README.md
 

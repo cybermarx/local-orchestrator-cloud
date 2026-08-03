@@ -30,7 +30,7 @@ smoke.py 做「导入全部模块 + 真正调用 main 入口」的契约感知�
   NVIDIA_BASE_URL       默认 https://integrate.api.nvidia.com/v1(也可由 config 的 url 字段回退)
   AGENT_NVIDIA_FLASH    默认 "deepseek-ai/deepseek-v4-flash, z-ai/glm-5.2, minimaxai/minimax-m3, stepfun-ai/step-3.7-flash"
   AGENT_NVIDIA_PRO      默认 "deepseek-ai/deepseek-v4-pro, nvidia/llama-3.1-nemotron-ultra-253b-v1"
-  AGENT_DELEGATE_BACKEND 默认 siliconflow(用 SiliconFlow 作云端 subagent 后端);设 nvidia 可切回 NVIDIA
+  AGENT_DELEGATE_BACKEND 默认 siliconflow;可选 free(聚合全部免费厂商,按模型自动路由)/ zhipu / ali / volcano / tencent / nvidia / siliconflow;设 nvidia 可切回 NVIDIA
   SILICONFLOW_API_KEY   可选;优先读环境变量,否则读项目根目录 git-ignored 的 local_config.json(避免每次手输;不写入本文件 / 不入库)
   SILICONFLOW_BASE_URL  默认 https://api.siliconflow.cn/v1
   AGENT_SILICONFLOW_FLASH 默认 "Qwen/Qwen3.5-35B-A3B, deepseek-ai/DeepSeek-V3.2"  # 券内:快/省(A3B MoE);V3.2 兜底
@@ -212,7 +212,9 @@ NVIDIA_BASE_URL = (
 ).rstrip("/")
 NVIDIA_FLASH = [x.strip() for x in os.environ.get(
     "AGENT_NVIDIA_FLASH",
-    "deepseek-ai/deepseek-v4-flash, z-ai/glm-5.2, minimaxai/minimax-m3, stepfun-ai/step-3.7-flash").split(",") if x.strip()]
+    "deepseek-ai/deepseek-v4-flash, z-ai/glm-5.2, minimaxai/minimax-m3, stepfun-ai/step-3.7-flash, "
+    "moonshotai/kimi-k2.6, nvidia/nemotron-3-ultra-550b-a55b, qwen/qwen3.5-397b-a17b, "
+    "nvidia/llama-3.3-nemotron-super-49b-v1.5").split(",") if x.strip()]
 NVIDIA_PRO = [x.strip() for x in os.environ.get(
     "AGENT_NVIDIA_PRO",
     "deepseek-ai/deepseek-v4-pro, nvidia/llama-3.1-nemotron-ultra-253b-v1").split(",") if x.strip()]
@@ -234,6 +236,79 @@ SILICONFLOW_FLASH = [x.strip() for x in os.environ.get(
 SILICONFLOW_PRO = [x.strip() for x in os.environ.get(
     "AGENT_SILICONFLOW_PRO",
     "deepseek-ai/DeepSeek-V3.2, deepseek-ai/DeepSeek-V3.1-Terminus, Qwen/Qwen3.5-35B-A3B").split(",") if x.strip()]
+
+# ----------------------------------------------------------------------------
+# 免费厂商聚合后端(free):智谱 / 阿里 / 火山 / 腾讯 / NVIDIA / SiliconFlow
+# 全部 OpenAI 兼容 /chat/completions;统一复用 _openai_chat。free_chat 按模型 id
+# 归属选厂商。各厂商 key 优先读环境变量,否则读 git-ignored 的 local_config.json。
+# ----------------------------------------------------------------------------
+ZHIPI_API_KEY = os.environ.get("ZHIPI_API_KEY", "").strip() or _load_local_secret("ZHIPI_API_KEY")
+ZHIPI_BASE_URL = os.environ.get("ZHIPI_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").rstrip("/")
+ZHIPI_FLASH = [x.strip() for x in os.environ.get(
+    "AGENT_ZHIPI_FLASH", "glm-4.7-flash, glm-4.6v-flash").split(",") if x.strip()]
+ZHIPI_PRO = ZHIPI_FLASH
+
+ALI_API_KEY = os.environ.get("ALI_API_KEY", "").strip() or _load_local_secret("ALI_API_KEY")
+ALI_BASE_URL = os.environ.get("ALI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1").rstrip("/")
+ALI_FLASH = [x.strip() for x in os.environ.get(
+    "AGENT_ALI_FLASH", "qwen-turbo, qwen3.5-turbo, qwen3-max, qwen3-coder-plus, qwen-plus").split(",") if x.strip()]
+ALI_PRO = ALI_FLASH
+
+VOLCANO_API_KEY = os.environ.get("VOLCANO_API_KEY", "").strip() or _load_local_secret("VOLCANO_API_KEY")
+VOLCANO_BASE_URL = os.environ.get("VOLCANO_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
+VOLCANO_FLASH = [x.strip() for x in os.environ.get(
+    "AGENT_VOLCANO_FLASH", "doubao-seed-2-0-lite-260428, doubao-seed-2-0-mini-260215").split(",") if x.strip()]
+VOLCANO_PRO = VOLCANO_FLASH
+
+TENCENT_API_KEY = os.environ.get("TENCENT_API_KEY", "").strip() or _load_local_secret("TENCENT_API_KEY")
+TENCENT_BASE_URL = os.environ.get("TENCENT_BASE_URL", "https://api.hunyuan.cloud.tencent.com/v1").rstrip("/")
+TENCENT_FLASH = [x.strip() for x in os.environ.get(
+    "AGENT_TENCENT_FLASH", "hy3, hunyuan-lite, Hunyuan-T1, Hunyuan-TurboS").split(",") if x.strip()]
+TENCENT_PRO = TENCENT_FLASH
+
+# 厂商注册表: name -> (key, base_url, 中文标签)
+CLOUD_PROVIDERS = {
+    "zhipu": (ZHIPI_API_KEY, ZHIPI_BASE_URL, "智谱BigModel"),
+    "ali": (ALI_API_KEY, ALI_BASE_URL, "阿里百炼"),
+    "volcano": (VOLCANO_API_KEY, VOLCANO_BASE_URL, "火山豆包"),
+    "tencent": (TENCENT_API_KEY, TENCENT_BASE_URL, "腾讯混元"),
+    "nvidia": (NVIDIA_API_KEY, NVIDIA_BASE_URL, "NVIDIA NIM"),
+    "siliconflow": (SILICONFLOW_API_KEY, SILICONFLOW_BASE_URL, "SiliconFlow"),
+}
+# 各厂商免费模型清单(用于构建路由器候选 + 模型->厂商映射)
+PROVIDER_MODELS = {
+    "zhipu": ZHIPI_FLASH,
+    "ali": ALI_FLASH,
+    "volcano": VOLCANO_FLASH,
+    "tencent": TENCENT_FLASH,
+    "nvidia": NVIDIA_FLASH,
+    "siliconflow": SILICONFLOW_FLASH,
+}
+# 模型 -> 厂商(首个命中者);free_chat 据此把模型路由到正确厂商
+MODEL_TO_PROVIDER = {}
+for _pn, _ms in PROVIDER_MODELS.items():
+    for _m in _ms:
+        MODEL_TO_PROVIDER.setdefault(_m, _pn)
+
+# free 聚合路由器的候选排序(强->弱、稳->不稳);只保留已注册到某厂商的模型
+FREE_FLASH_ORDER = [
+    "nex-agi/Nex-N2-Pro", "deepseek-ai/deepseek-v4-flash", "hy3", "qwen3-max",
+    "glm-4.7-flash", "doubao-seed-2-0-lite-260428", "Qwen/Qwen3-8B", "hunyuan-lite",
+    "qwen-turbo", "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "z-ai/glm-5.2",
+    "Qwen/Qwen3.5-4B", "Hunyuan-T1", "doubao-seed-2-0-mini-260215", "glm-4.6v-flash",
+    "qwen3.5-turbo", "qwen3-coder-plus", "qwen-plus", "Hunyuan-TurboS",
+    "minimaxai/minimax-m3", "moonshotai/kimi-k2.6", "nvidia/nemotron-3-ultra-550b-a55b",
+    "DeepSeek-OCR", "BAAI/bge-m3",
+]
+FREE_DEFAULT_PROVIDER = os.environ.get("AGENT_FREE_PROVIDER", "siliconflow").strip().lower() or "siliconflow"
+
+
+def free_chat(model, messages, timeout=DELEGATE_TIMEOUT, use_json=True):
+    """free 聚合后端:按模型 id 归属选厂商(未知则回退 AGENT_FREE_PROVIDER),统一走 _openai_chat。"""
+    prov = MODEL_TO_PROVIDER.get(model) or FREE_DEFAULT_PROVIDER
+    key, base, label = CLOUD_PROVIDERS.get(prov, CLOUD_PROVIDERS["siliconflow"])
+    return _openai_chat(key, base, label, model, messages, timeout, use_json)
+
 BACKOFF = float(os.environ.get("AGENT_429_BACKOFF", "5"))
 # 限速(429/50609/503)是账号级且暂时的,与"模型不可用"性质完全不同:
 # 换模型没用(配额按账号算),消耗 failover 候选更是把好模型白白划掉。
@@ -334,6 +409,10 @@ class ModelRouter:
 
 ROUTER = ModelRouter(NVIDIA_FLASH, NVIDIA_PRO)
 ROUTER_SF = ModelRouter(SILICONFLOW_FLASH, SILICONFLOW_PRO)
+
+# free 聚合路由器:候选跨越所有厂商,任一厂商失败时跳到下一厂商模型
+_FREE_FLASH = [m for m in FREE_FLASH_ORDER if m in MODEL_TO_PROVIDER]
+ROUTER_FREE = ModelRouter(_FREE_FLASH, _FREE_FLASH)
 
 
 class LocalRouter:
@@ -908,7 +987,8 @@ def _openai_chat(key, base_url, backend_label, model, messages, timeout=DELEGATE
     """通用 OpenAI 兼容 /chat/completions 调用:NVIDIA 与 SiliconFlow 共用。"""
     if not key:
         raise RuntimeError(
-            f"未找到 {backend_label} API key：请设置对应的环境变量（NVIDIA_API_KEY 或 SILICONFLOW_API_KEY）"
+            f"未找到 {backend_label} API key：请设置对应厂商环境变量"
+            f"（如 ZHIPI_API_KEY / ALI_API_KEY / VOLCANO_API_KEY / TENCENT_API_KEY）或写入 local_config.json"
         )
     payload = {"model": model, "messages": messages, "temperature": 0.7, "max_tokens": 4096}
     if use_json:
@@ -1500,12 +1580,23 @@ def _sf_ready():
     return bool(SILICONFLOW_API_KEY)
 
 
+def _cloud_ready():
+    """任一云端厂商 key 就绪即认为混合模式可用(覆盖 free 聚合与所有具体厂商)。"""
+    return any(bool(k) for (k, _, _) in CLOUD_PROVIDERS.values())
+
+
 def _resolve_backend(backend):
     """按后端名解析 (router, chat_fn, tries, timeout)。"""
     if backend == "ollama":
         return ROUTER_LOCAL, ollama_subagent_chat, LOCAL_DELEGATE_TRIES, LOCAL_TIMEOUT
     if backend == "siliconflow":
         return ROUTER_SF, siliconflow_chat, MAX_DELEGATE_TRIES, DELEGATE_TIMEOUT
+    if backend == "free":
+        return ROUTER_FREE, free_chat, MAX_DELEGATE_TRIES, DELEGATE_TIMEOUT
+    if backend in CLOUD_PROVIDERS:
+        # 指定单一厂商:用该厂商模型列表构建路由器,仍经 free_chat 路由(自动命中该厂商)
+        models = PROVIDER_MODELS.get(backend, [])
+        return ModelRouter(models, models), free_chat, MAX_DELEGATE_TRIES, DELEGATE_TIMEOUT
     return ROUTER, nvidia_chat, MAX_DELEGATE_TRIES, DELEGATE_TIMEOUT
 
 
@@ -1514,7 +1605,7 @@ def _phase_backend(phase):
     长输出(gen 模块代码 / repair 修复产出)→ 云端 SiliconFlow,免 IQ2_M 截断;
     短决策(diag 诊断 / split 拆分 / aggregate 聚合)→ 本地 35B,省 API 成本且思考链装得下。
     --local(DELEGATE_BACKEND=ollama)→ 一切本地;AGENT_HYBRID=0 → 一切跟随 DELEGATE_BACKEND。"""
-    if DELEGATE_BACKEND != "ollama" and HYBRID and _sf_ready():
+    if DELEGATE_BACKEND != "ollama" and HYBRID and _cloud_ready():
         if phase in ("gen", "repair"):
             return "siliconflow"
         if phase in ("diag", "split", "aggregate"):
@@ -2884,7 +2975,23 @@ def main():
             return
         _interactive(ROUTER_LOCAL, "本地")
         return
-    if DELEGATE_BACKEND == "siliconflow":
+    if DELEGATE_BACKEND == "free":
+        backend_key = ""
+        backend_flash = list(MODEL_TO_PROVIDER.keys())
+        backend_pro = backend_flash
+        backend_name = "Free(聚合)"
+        backend_src = "local_config.json / 环境变量(多厂商)"
+        backend_router = ROUTER_FREE
+    elif DELEGATE_BACKEND in CLOUD_PROVIDERS:
+        key, base, label = CLOUD_PROVIDERS[DELEGATE_BACKEND]
+        backend_key = key
+        backend_flash = PROVIDER_MODELS.get(DELEGATE_BACKEND, [])
+        backend_pro = backend_flash
+        backend_name = label
+        envk = os.environ.get(DELEGATE_BACKEND.upper() + "_API_KEY", "").strip()
+        backend_src = "环境变量" if envk else ("local_config.json" if key else "无")
+        backend_router = ModelRouter(backend_flash, backend_pro)
+    elif DELEGATE_BACKEND == "siliconflow":
         backend_key, backend_flash, backend_pro, backend_name = SILICONFLOW_API_KEY, SILICONFLOW_FLASH, SILICONFLOW_PRO, "SiliconFlow"
         backend_src = "local_config.json" if (SILICONFLOW_API_KEY and not os.environ.get("SILICONFLOW_API_KEY", "").strip()) else ("环境变量" if SILICONFLOW_API_KEY else "无")
         backend_router = ROUTER_SF
@@ -2893,10 +3000,16 @@ def main():
         backend_src = _KEY_SOURCE or "无"
         backend_router = ROUTER
     print(f"   工具: delegate(云端subagent/{backend_name}) + assemble(组装+冒烟) + verify | 档位: flash={len(backend_flash)} pro={len(backend_pro)}")
-    if DELEGATE_BACKEND != "ollama" and HYBRID and _sf_ready():
+    if DELEGATE_BACKEND != "ollama" and HYBRID and _cloud_ready():
         diag_dest = "云端" if DIAG_BACKEND == "cloud" else "本地"
         print(f"   ⚡ 混合模式: 编排器=本地35B · 模块生成/修复产出→云端{backend_name} · 诊断/拆分/聚合→{diag_dest}(AGENT_HYBRID=0 全云端 · AGENT_DIAG_BACKEND=cloud 诊断也上云)")
-    if not backend_key:
+    if DELEGATE_BACKEND == "free":
+        if _cloud_ready():
+            nready = sum(1 for (k, _, _) in CLOUD_PROVIDERS.values() if k)
+            print(f"   🔑 Free 聚合: {nready} 个厂商已配 key(任一可用即自动路由)")
+        else:
+            print(f"   ⚠ 未检测到任何免费厂商 API key —— delegate 将报错,请写入 local_config.json 或设环境变量")
+    elif not backend_key:
         print(f"   ⚠ 未检测到 {backend_name} API key —— delegate 将报错,请先设置对应环境变量或写入 local_config.json")
     else:
         masked = backend_key[:10] + "…" + backend_key[-4:]
