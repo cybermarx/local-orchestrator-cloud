@@ -1493,6 +1493,7 @@ def _split_and_recurse(task, name, contract, prev_manifest, tier, depth,
 
 
 HYBRID = os.environ.get("AGENT_HYBRID", "1").lower() in ("1", "true", "yes", "on")
+DIAG_BACKEND = os.environ.get("AGENT_DIAG_BACKEND", "").strip().lower()  # "cloud"=诊断/拆分/聚合强制走云端,消本地慢模型挂起
 
 
 def _sf_ready():
@@ -1517,6 +1518,10 @@ def _phase_backend(phase):
         if phase in ("gen", "repair"):
             return "siliconflow"
         if phase in ("diag", "split", "aggregate"):
+            # 默认诊断/拆分/聚合留本地省成本;本地慢模型(如 IQ2_M 量化)会挂 100s+ 时,
+            # 设 AGENT_DIAG_BACKEND=cloud 把这类短决策也丢云端(走当前云端后端)。
+            if DIAG_BACKEND == "cloud":
+                return DELEGATE_BACKEND
             return "ollama"
     return DELEGATE_BACKEND
 
@@ -2149,19 +2154,94 @@ _WEAK_ASSERT_PATTERNS = [
      '仅用 len()>0 验存在性,不校验内容:空壳/占位也能通过'),
 ]
 
+# 宽泛容器/类型:任何返回值基本都能满足,单靠它们做断言等于没校验
+_WEAK_BROAD_TYPES = {"dict", "list", "tuple", "set", "object", "nonetype", "type", "any"}
+
+
+def _type_names(typ):
+    """从 isinstance 的第二个参数里取出类型名集合(支持单名 / 属性 / 元组)。"""
+    if isinstance(typ, ast.Name):
+        return {typ.id}
+    if isinstance(typ, ast.Attribute):
+        return {typ.attr}
+    if isinstance(typ, (ast.Tuple, ast.List)):
+        s = set()
+        for e in typ.elts:
+            s |= _type_names(e)
+        return s
+    return set()
+
+
+def _assert_expr_is_weak(node):
+    """判断一条 assert 的测试表达式是否『弱』——仅由 `is/is not None` 与
+    `isinstance(x, 宽泛容器)` / 裸真值 组成,不含任何真实行为校验。
+    返回 True 表示该断言不构成有效验证(任何返回都不报错)。"""
+    def walk(n):
+        if isinstance(n, ast.BoolOp):               # and / or:要求每个分支都弱
+            return all(walk(v) for v in n.values)
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.Not):
+            return walk(n.operand)
+        if isinstance(n, ast.Compare):
+            # 仅当单个 `is`/`is not` 且比较对象是 None 才可能算弱
+            if len(n.ops) == 1 and isinstance(n.ops[0], (ast.Is, ast.IsNot)):
+                other = n.comparators[0]
+                if isinstance(other, ast.Constant) and other.value is None:
+                    # 裸变量/属性 `x is not None` 才算弱(任何返回都不报错);
+                    # 直接 `f(x) is not None` 是有效冒烟(真的执行了函数、确认有产出)
+                    return isinstance(n.left, (ast.Name, ast.Attribute))
+                return False                        # `x is True` 等具体判定 → 有意义
+            return False                            # ==, >, <, in ... 都是有意义的比较
+        if isinstance(n, ast.Call):
+            if (isinstance(n.func, ast.Name) and n.func.id == "isinstance"
+                    and len(n.args) >= 2):
+                names = {x.lower() for x in _type_names(n.args[1])}
+                return bool(names) and all(nm in _WEAK_BROAD_TYPES for nm in names)
+            return False                            # 其它函数调用(如 foo()==x 外层有 Compare 包着)
+        if isinstance(n, (ast.Name, ast.Attribute)):
+            return True                             # 裸变量/属性真值判断(assert result)→ 弱
+        if isinstance(n, ast.Subscript):
+            return False                            # x['key'] 在查具体内容 → 有意义
+        return False
+    return walk(node.test)
+
+
 def _warn_weak_assert(test_code: str) -> str:
-    """扫描 test_code,若命中过弱断言模式返回告警文本(空串表示未发现)。"""
+    """扫描 test_code 的断言强度,返回告警文本(空串表示未发现弱断言)。两层:
+    ① 正则兜底(恒真 / len>0 / Error-not-in);
+    ② AST 分析——若『全部断言』都只做 `is not None` / `isinstance(容器)` / 裸真值,
+       则任何返回值都不报错,『通过』是假阳性,必须提示。"""
     if not test_code:
         return ""
     hits = []
     for pat, msg in _WEAK_ASSERT_PATTERNS:
         if pat.search(test_code):
             hits.append(msg)
-    if not hits:
+    ast_note = ""
+    try:
+        tree = ast.parse(test_code)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        asserts = [n for n in ast.walk(tree) if isinstance(n, ast.Assert)]
+        if not asserts:
+            ast_note = "测试没有任何 assert,只 import 不校验行为,修复未被验证"
+        else:
+            weak = sum(1 for a in asserts if _assert_expr_is_weak(a))
+            if weak == len(asserts):
+                ast_note = (f"全部 {len(asserts)} 条断言均为弱校验(仅 `is not None` / "
+                            f"`isinstance(容器)` / 裸真值),任何返回都不报错,"
+                            f"无法证明修复有效——『通过』是假阳性")
+            elif weak:
+                ast_note = f"有 {weak}/{len(asserts)} 条断言偏弱(仅 `is not None` / `isinstance(容器)`)"
+    if not hits and not ast_note:
         return ""
-    return ("⚠ [verify 防作弊] 检测到可能过弱的断言,请确认其确实在验证核心行为而非强行变绿:"
-            + "".join(f"\n   - {h}" for h in hits)
-            + "\n   若校验失败,应修正测试逻辑或修复项目,不要放宽断言。")
+    parts = []
+    if ast_note:
+        parts.append(ast_note)
+    parts += hits
+    return ("⚠ [verify 防作弊] " + "; ".join(parts) +
+            "。请补充针对返回内容/副作用的真实断言(如校验返回字典的某个键、调用后状态变化、"
+            "异常路径),否则『通过』只是没报错,而非真的修对。")
 
 def verify(project_name: str, test_code: str, name: str = None) -> str:
     """对已 assemble 的项目做一「片」集成校验。
@@ -2670,6 +2750,7 @@ _MANUAL = """\
   AGENT_NUM_CTX 编排器上下文窗口(默认8192)  AGENT_SUB_CTX_MAX 放大上限(默认24576,8GB显存勿再调大)
   AGENT_BUDGET 压缩触发预算  AGENT_CONTRACT_CHECK 契约校验开关  AGENT_GUARD_SHADOW 影子模块告警
   AGENT_MAX_ORCH_DEPTH 分层子编排器深度上限(默认2)  AGENT_HYBRID 混合模式开关(默认1,0=全跟随后端)
+  AGENT_DIAG_BACKEND 诊断/拆分/聚合后端(默认空=本地;设 cloud=强制上云端,消本地慢模型挂起)
   SILICONFLOW_API_KEY 硅基流动密钥(env 或 local_config.json)  AGENT_SILICONFLOW_FLASH/PRO 云端模型清单
 """
 
@@ -2813,7 +2894,8 @@ def main():
         backend_router = ROUTER
     print(f"   工具: delegate(云端subagent/{backend_name}) + assemble(组装+冒烟) + verify | 档位: flash={len(backend_flash)} pro={len(backend_pro)}")
     if DELEGATE_BACKEND != "ollama" and HYBRID and _sf_ready():
-        print(f"   ⚡ 混合模式: 编排器=本地35B · 模块生成/修复产出→云端{backend_name} · 诊断/拆分/聚合→本地(AGENT_HYBRID=0 可关)")
+        diag_dest = "云端" if DIAG_BACKEND == "cloud" else "本地"
+        print(f"   ⚡ 混合模式: 编排器=本地35B · 模块生成/修复产出→云端{backend_name} · 诊断/拆分/聚合→{diag_dest}(AGENT_HYBRID=0 全云端 · AGENT_DIAG_BACKEND=cloud 诊断也上云)")
     if not backend_key:
         print(f"   ⚠ 未检测到 {backend_name} API key —— delegate 将报错,请先设置对应环境变量或写入 local_config.json")
     else:
