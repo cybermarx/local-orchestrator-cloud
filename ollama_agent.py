@@ -122,7 +122,9 @@ THINK_ON_SPLIT = os.environ.get("AGENT_THINK_ON_SPLIT", "1").lower() in ("1", "t
 # THINK_ON_REPAIR:非两阶段(云端/回退)时,单次修复调用是否开思考(默认关:修复输出含整段代码,长输出+思考有撑爆窗口风险)。
 THINK_ON_REPAIR = os.environ.get("AGENT_THINK_ON_REPAIR", "0").lower() in ("1", "true", "yes", "on")
 THINK_NUM_CTX = int(os.environ.get("AGENT_THINK_NUM_CTX", "16384"))  # 思考步骤的 num_ctx 下限
-
+# 编排器历史(估算 token)超过该阈值后强制关思考:本 GGUF 思考链恒 8K+,历史一大思考会
+# 抢在输出前吃光 num_predict 预算 → done_reason=length 空内容死循环。思考只在前几轮规划有价值。
+THINK_OFF_HISTORY = int(os.environ.get("AGENT_THINK_OFF_HISTORY", "6000"))
 # --- 两阶段 repair(诊断→修复):把"需推理的短诊断"与"不需推理的长修复"拆开 ------
 # 修复本质是"诊断(为什么错、怎么改)+ 改代码"两种性质相反的工作。捆一次调用 → 想开思考
 # 诊断却被长代码撑爆窗口。拆成:①诊断(开思考·短输出,实测175字符/34s/更准) ②修复(关思考·
@@ -760,6 +762,46 @@ def _subtask_inventory() -> str:
         lines.append("  ⚠ 重复提供: " + ", ".join(dup) +
                      " 由多个模块提供,请合并或删除其一")
     return "\n".join(lines) if lines else "(空)"
+
+
+def _dup_provides_note(contract, exclude_id=None, exclude_name=None) -> str:
+    """delegate 前的『已有符号速查』:请求的 provides 若已被侧边存储里的模块提供,
+    返回一条警示文本(打断 35B 重复 delegate——它记不住自己已写过 rouge_core,
+    会换个名字再 delegate 一遍,造成多模块争相提供同一符号)。"""
+    provides = (contract or {}).get("provides") or []
+    if not provides:
+        return ""
+    excl = set()
+    if exclude_id is not None:
+        excl.add(exclude_id)
+    if exclude_name:
+        _n = _norm_module_name(exclude_name)
+        if _n:
+            for st in SUBTASKS:
+                if st.get("manifest", {}).get("module") == _n:
+                    excl.add(st.get("id"))
+    holder = {}
+    for st in SUBTASKS:
+        if st.get("id") in excl:
+            continue
+        m = st.get("manifest", {}) or {}
+        mod = m.get("module") or ""
+        if mod == "main.py" or st.get("is_subsystem"):
+            continue
+        for p in (m.get("provides") or []):
+            sym = p.split("(")[0].split("->")[0].strip()
+            if sym:
+                holder.setdefault(sym, []).append(mod)
+    dup = []
+    for p in provides:
+        sym = p.split("(")[0].split("->")[0].strip()
+        if sym in holder:
+            dup.append(f"{sym}({'、'.join(sorted(set(holder[sym])))})")
+    if not dup:
+        return ""
+    return ("⚠ 已有符号速查: 你要提供的 " + ", ".join(dup) +
+            " 已存在于侧边存储。若非修复这些模块本身,请勿重复实现同名符号"
+            "(会导致多模块争相提供同一符号、契约校验告警);确需新增时请改用不同的对外符号名。")
 
 
 # ----------------------------------------------------------------------------
@@ -1410,6 +1452,14 @@ def delegate(task: str, tier: str = "flash", name: str = None,
         contract = {"provides": provides or [], "depends_on": depends_on or []}
     tried = set()  # 本轮回避:同一模型本轮不再重试
     label = name or task[:14]
+    # 防重复 delegate:请求的 provides 已有模块提供时,把警示并入子任务(35B 记不住侧边存储里已有什么)
+    _dup = _dup_provides_note(contract, replace_id, name)
+    if _dup:
+        if repair is not None:
+            repair = dict(repair)
+            repair["original_task"] = _dup + "\n" + repair.get("original_task", task)
+        else:
+            task = _dup + "\n" + task
     # 两阶段修复:先诊断(开思考·短输出),再据诊断决定"递归重写"还是"局部小修"。
     # 化解"想开思考但长输出会撑爆窗口"的假两难——诊断与修复本是两种相反性质的工作,拆开就没了。
     # 诊断永远走短决策后端(local);修复产出按 phase 路由(hybrid 下=云端,免截断)。
@@ -2125,7 +2175,11 @@ def _ollama_chat(messages: list, force_no_think: bool = False) -> dict:
         "temperature": TEMPERATURE,
         "num_predict": _output_budget(messages),
     }
-    if force_no_think or not ENABLE_THINKING:
+    # 历史一大就强制关思考:本 GGUF 思考链恒 8K+,会抢在输出前吃光 num_predict 预算
+    # → done_reason=length、content 为空(实测第 10+ 步起反复截断空内容的死循环)。
+    # 思考只在前几轮「规划」有价值,历史累积后关掉,把预算留给工具调用本身。
+    if (force_no_think or not ENABLE_THINKING
+            or history_tokens(messages) > THINK_OFF_HISTORY):
         # think:false 是 Ollama 对 Qwen3 真正生效的关思考开关(enable_thinking 对本 GGUF 无效)
         opts["enable_thinking"] = False
         opts["think"] = False
