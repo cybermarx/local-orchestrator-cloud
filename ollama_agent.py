@@ -639,8 +639,41 @@ def delegate_subsystem(task: str, subdir: str, name: str = None,
                            subdir, parent, depth)
 
 
-def _seed_one_file(full: str, fn: str) -> bool:
-    """载入单个已有 .py 文件为 is_existing 节点。成功返回 True。"""
+_SEED_TEST_PATTERNS = ("test_", "_test", "_diag", "_verify", "conftest")
+
+
+def _is_test_artifact(fn):
+    """verify/诊断产生的测试类产物,不应作为『要保留接口』的已有模块载入。"""
+    f = fn.lower()
+    return (f.startswith(_SEED_TEST_PATTERNS) or f.endswith("_test.py")
+            or f == "conftest.py")
+
+
+def _is_self_import(fn, code):
+    """自引用影子模块:文件 import 了自己的模块名(如 requests.py 里 import requests)。
+    这种文件遮蔽同名真库且必然自引用递归,是上一轮 bug 的残留,应跳过而非保留。"""
+    stem = fn[:-3] if fn.endswith(".py") else fn
+    if not stem or stem in ("main", "__init__"):
+        return False
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for n in node.names:
+                if n.name.split(".")[0] == stem:
+                    return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.module.split(".")[0] == stem:
+                return True
+    return False
+
+
+def _seed_one_file(full: str, fn: str, filter_junk: bool = False) -> bool:
+    """载入单个已有 .py 文件为 is_existing 节点。成功返回 True。
+    filter_junk: 目录模式开启——跳过测试产物/影子模块/自引用模块,
+    避免把垃圾文件也当『要保留接口』载入,导致清单暴涨吃光编排器上下文。"""
     try:
         with open(full, encoding="utf-8") as f:
             code = f.read()
@@ -649,6 +682,16 @@ def _seed_one_file(full: str, fn: str) -> bool:
         return False
     if not code.strip():
         return False
+    if filter_junk:
+        if _is_test_artifact(fn):
+            print(f"   ⏭ 跳过测试/诊断产物: {fn}")
+            return False
+        if _shadow_warning(fn):
+            print(f"   ⏭ 跳过影子模块: {fn}(遮蔽标准库/第三方库,不入『保留接口』清单)")
+            return False
+        if _is_self_import(fn, code):
+            print(f"   ⏭ 跳过自引用影子模块: {fn}(import 自己,遮蔽同名真库)")
+            return False
     provides = sorted(_defined_top_names(code))
     sid = len(SUBTASKS) + 1
     SUBTASKS.append({
@@ -690,7 +733,7 @@ def _seed_existing_code(path: str) -> int:
         full = os.path.join(p, fn)
         if not os.path.isfile(full):
             continue
-        if _seed_one_file(full, fn):
+        if _seed_one_file(full, fn, filter_junk=True):
             count += 1
     return count
 
@@ -2491,7 +2534,7 @@ def _task_loop(q: str, router, improve_path=None):
 
 
 def main():
-    global DELEGATE_BACKEND
+    global DELEGATE_BACKEND, NUM_CTX
     parser = argparse.ArgumentParser(
         description="🦙 本地多智能体编排器:串行递归 + 侧边存储 + 契约感知组装(全本地 Ollama 35B)",
         epilog=_MANUAL,
@@ -2519,6 +2562,11 @@ def main():
 
     # --improve:把已有代码载入侧边存储,并把「在此基础改进」的指引前置到任务里
     if args.improve:
+        # improve/fix-project 的任务提示词较长(模块清单 + 巡检项),配合思考链 8K+
+        # 会把 8192 窗口吃光导致工具参数截断→空内容;给编排器更大的窗口(16384 已被思考步骤验证安全)。
+        if NUM_CTX < 16384:
+            print(f"   ⚙ --improve/--fix-project 提示词较长,编排器 num_ctx {NUM_CTX}→16384")
+            NUM_CTX = 16384
         n = _seed_existing_code(args.improve)
         if n:
             inv = _subtask_inventory()
