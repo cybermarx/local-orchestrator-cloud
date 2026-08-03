@@ -33,8 +33,8 @@ smoke.py 做「导入全部模块 + 真正调用 main 入口」的契约感知�
   AGENT_DELEGATE_BACKEND 默认 siliconflow(用 SiliconFlow 作云端 subagent 后端);设 nvidia 可切回 NVIDIA
   SILICONFLOW_API_KEY   可选;优先读环境变量,否则读项目根目录 git-ignored 的 local_config.json(避免每次手输;不写入本文件 / 不入库)
   SILICONFLOW_BASE_URL  默认 https://api.siliconflow.cn/v1
-  AGENT_SILICONFLOW_FLASH 默认 "deepseek-ai/DeepSeek-V3, Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-9B"
-  AGENT_SILICONFLOW_PRO   默认 "deepseek-ai/DeepSeek-V3.2, deepseek-ai/DeepSeek-R1, deepseek-ai/DeepSeek-V3.1-Terminus"
+  AGENT_SILICONFLOW_FLASH 默认 "Qwen/Qwen3.5-35B-A3B, deepseek-ai/DeepSeek-V3.2"  # 券内:快/省(A3B MoE);V3.2 兜底
+  AGENT_SILICONFLOW_PRO   默认 "deepseek-ai/DeepSeek-V3.2, deepseek-ai/DeepSeek-V3.1-Terminus, Qwen/Qwen3.5-35B-A3B"  # 券内最强三档
   AGENT_DELEGATE_TIMEOUT 默认 120 (秒,单轮内失败会自动切换到下一个候选模型)
   AGENT_LATENCY_WARN    默认 30 (秒,超过记降级)
   AGENT_MODEL_COOLDOWN  默认 60 (秒,熔断冷却)
@@ -227,10 +227,10 @@ SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "").strip() or _load
 SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1").rstrip("/")
 SILICONFLOW_FLASH = [x.strip() for x in os.environ.get(
     "AGENT_SILICONFLOW_FLASH",
-    "deepseek-ai/DeepSeek-V3, Qwen/Qwen3.5-35B-A3B, Qwen/Qwen3.5-9B").split(",") if x.strip()]
+    "Qwen/Qwen3.5-35B-A3B, deepseek-ai/DeepSeek-V3.2").split(",") if x.strip()]
 SILICONFLOW_PRO = [x.strip() for x in os.environ.get(
     "AGENT_SILICONFLOW_PRO",
-    "deepseek-ai/DeepSeek-V3.2, deepseek-ai/DeepSeek-R1, deepseek-ai/DeepSeek-V3.1-Terminus").split(",") if x.strip()]
+    "deepseek-ai/DeepSeek-V3.2, deepseek-ai/DeepSeek-V3.1-Terminus, Qwen/Qwen3.5-35B-A3B").split(",") if x.strip()]
 BACKOFF = float(os.environ.get("AGENT_429_BACKOFF", "5"))
 PROJECT_DIR = os.environ.get("AGENT_PROJECT_DIR", "./projects")
 REPAIR_ROUNDS = int(os.environ.get("AGENT_REPAIR_ROUNDS", "3"))
