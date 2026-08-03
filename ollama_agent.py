@@ -40,7 +40,9 @@ smoke.py 做「导入全部模块 + 真正调用 main 入口」的契约感知�
   AGENT_MODEL_COOLDOWN  默认 60 (秒,熔断冷却)
   AGENT_MODEL_MAX_FAILS 默认 3 (连续失败次数触发熔断)
   AGENT_DELEGATE_TRIES  默认 6 (failover 总尝试次数)
-  AGENT_429_BACKOFF     默认 5 (秒,账号级限速退避)
+  AGENT_429_BACKOFF     默认 5 (秒,账号级限速退避基数,按 2^n 指数增长+抖动)
+  AGENT_429_RETRIES     默认 5 (限速专用重试次数,不消耗 failover 候选预算)
+  AGENT_429_MAX_WAIT    默认 60 (秒,单次限速退避上限)
   AGENT_PROJECT_DIR     默认 ./projects
   AGENT_REPAIR_ROUNDS   默认 3 (链接后自动修复闭环的最大轮次)
 """
@@ -51,6 +53,7 @@ import sys
 import re
 import ast
 import time
+import random
 import subprocess
 import urllib.request
 import urllib.error
@@ -232,6 +235,11 @@ SILICONFLOW_PRO = [x.strip() for x in os.environ.get(
     "AGENT_SILICONFLOW_PRO",
     "deepseek-ai/DeepSeek-V3.2, deepseek-ai/DeepSeek-V3.1-Terminus, Qwen/Qwen3.5-35B-A3B").split(",") if x.strip()]
 BACKOFF = float(os.environ.get("AGENT_429_BACKOFF", "5"))
+# 限速(429/50609/503)是账号级且暂时的,与"模型不可用"性质完全不同:
+# 换模型没用(配额按账号算),消耗 failover 候选更是把好模型白白划掉。
+# 故给限速单独一套预算:指数退避 + 抖动,且不占用 delegate 的候选尝试次数。
+RL_RETRIES = int(os.environ.get("AGENT_429_RETRIES", "5"))
+RL_MAX_WAIT = float(os.environ.get("AGENT_429_MAX_WAIT", "60"))
 PROJECT_DIR = os.environ.get("AGENT_PROJECT_DIR", "./projects")
 REPAIR_ROUNDS = int(os.environ.get("AGENT_REPAIR_ROUNDS", "3"))
 
@@ -1230,6 +1238,58 @@ def _norm_module_name(name):
 _STDLIB_NAMES = set(getattr(sys, "stdlib_module_names", set()))
 
 
+# 知名第三方库的顶层导入名:即便本机没装,也不许拿来当模块名或对外符号名。
+# rouge_scraper 那次翻车正源于此——requests 本机没装,于是模型一轮轮自造替身
+# (requests.py 被拦 → lib_requests.py → requests_module.py),名字换了三次,病根没变。
+# 只认"没装"会让守卫恰好在最需要它的场景下失效:装了的库本来就没人想重写。
+_KNOWN_LIBS = {
+    "requests", "urllib3", "httpx", "aiohttp", "bs4", "lxml", "scrapy", "selenium",
+    "playwright", "numpy", "pandas", "scipy", "matplotlib", "sklearn", "torch",
+    "transformers", "flask", "django", "fastapi", "starlette", "pydantic", "sqlalchemy",
+    "click", "typer", "rich", "yaml", "toml", "dotenv", "jinja2", "PIL", "cv2",
+    "pytest", "tqdm", "openai", "anthropic", "redis", "pymysql", "psycopg2",
+    "cryptography", "websockets", "boto3", "paramiko", "dateutil", "pytz",
+}
+# 无依赖替代方案:守卫不能只说"不许",还得给出能立刻照做的下一步
+_STDLIB_ALT = {
+    "requests": "urllib.request", "httpx": "urllib.request", "urllib3": "urllib.request",
+    "aiohttp": "urllib.request", "bs4": "html.parser", "lxml": "html.parser",
+    "yaml": "json", "toml": "tomllib", "dotenv": "os.environ", "pytz": "zoneinfo",
+    "dateutil": "datetime", "pytest": "unittest", "redis": "sqlite3",
+}
+
+
+def _installed_kind(top):
+    """判定顶层名 top 是否会与一个"真库"撞名。
+    返回 '标准库' / '已安装第三方库' / '知名第三方库(本机未安装)' / None。
+    第三方只认 site-packages/dist-packages 里的,避免把项目自身目录下的同名业务模块误报。"""
+    if not top or top == "main":
+        return None
+    if top in _STDLIB_NAMES:
+        return "标准库"
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec(top)
+        if spec is not None and getattr(spec, "origin", None) not in (None, "namespace"):
+            origin = spec.origin or ""
+            if "site-packages" in origin or "dist-packages" in origin:
+                return "已安装第三方库"
+    except Exception:
+        pass
+    if top in _KNOWN_LIBS:
+        return "知名第三方库(本机未安装)"
+    return None
+
+
+def _lib_advice(sym, kind):
+    """针对撞名符号给出可立即执行的替代方案(而不是只说"不行")。"""
+    if kind.startswith("知名"):
+        alt = _STDLIB_ALT.get(sym)
+        return (f"'{sym}' 是{kind}——没装就更不该造替身"
+                + (f",请改用标准库 {alt} 实现" if alt else ",请改用标准库实现或换个方案"))
+    return f"'{sym}' 是{kind},直接 `import {sym}` 就能用,不要重写"
+
+
 def _shadow_warning(module_name):
     """检测模块名是否与 stdlib 或已安装第三方库同名 → 本地文件会遮蔽真库。
     典型灾难:delegate 一个 requests.py,里面 import requests 实为导入自己 → 自引用递归,
@@ -1238,27 +1298,53 @@ def _shadow_warning(module_name):
         return ""
     top = os.path.basename(module_name)
     top = top[:-3] if top.endswith(".py") else top
-    if not top or top == "main":
-        return ""
-    kind = None
-    if top in _STDLIB_NAMES:
-        kind = "标准库"
-    else:
-        try:
-            import importlib.util
-            # 屏蔽项目自身目录,避免把已交付的同名业务模块误报为第三方
-            spec = importlib.util.find_spec(top)
-            if spec is not None and getattr(spec, "origin", None) not in (None, "namespace"):
-                origin = spec.origin or ""
-                if "site-packages" in origin or "dist-packages" in origin:
-                    kind = "已安装第三方库"
-        except Exception:
-            pass
+    kind = _installed_kind(top)
     if not kind:
         return ""
-    return (f"模块名 '{top}' 与{kind}同名,本地文件会遮蔽真库(import {top} 将导入你自己→"
-            f"极易自引用递归并被上层 except 静默吞掉)。请改名(如 {top}_client.py)或直接 import 真库,"
-            f"不要 delegate 同名模块")
+    return (f"模块名 '{top}' 与{kind}同名(import {top} 会导入你自己 → 自引用递归,"
+            f"再被上层 except 静默吞掉,查都查不出来)。{_lib_advice(top, kind)};"
+            f"确需自建请改名(如 {top}_client.py),不要 delegate 同名模块")
+
+
+def _shim_symbols(provides):
+    """从 provides 列表里挑出与真实库撞名的对外符号,返回 [(符号, 库类型), ...]。"""
+    if not GUARD_STDLIB_SHADOW:
+        return []
+    bad = []
+    for p in (provides or []):
+        sym = p.split("(")[0].split("->")[0].strip()
+        if not sym or "." in sym or not sym.isidentifier():
+            continue
+        kind = _installed_kind(sym)
+        if kind:
+            bad.append((sym, kind))
+    return bad
+
+
+def _shim_provides_note(provides, hard=True):
+    """拦截『换皮自造轮子』:模块 provides 的符号与 stdlib/已装第三方库顶层名同名。
+
+    requests.py 被影子守卫按文件名拦下后,模型不会放弃——它换个文件名把同一个假库
+    再造一遍(lib_requests.py 提供 requests、requests_module.py 提供 requests)。
+    文件名合法了,危害一模一样:项目里凭空多出一个冒牌 requests,真库反而没人用,
+    而且下游 `from lib_requests import requests` 拿到的是个残废对象。
+    守卫必须下沉到符号层——看它『提供什么』,而不是只看它『叫什么』。
+
+    hard=True 返回拒绝文本(调用方应直接 return,不浪费一次云端调用);
+    hard=False 返回警示文本(修复模式用,允许模型把符号改名后继续)。
+    空串 = 放行。"""
+    bad = _shim_symbols(provides)
+    if not bad:
+        return ""
+    detail = ";".join(_lib_advice(s, k) for s, k in bad)
+    names = "、".join(f"'{s}'" for s, _ in bad)
+    tail = (f"若确实要封装,请让模块提供**不同名**的函数(如 http_get / http_post),"
+            f"绝不要提供一个叫 {bad[0][0]} 的对象。")
+    if hard:
+        return (f"[delegate 已拒绝] provides 里的 {names} 与真实库撞名——这是在造冒牌替身。"
+                f"{detail}。{tail}本次未调用模型,请改完契约再来。")
+    return (f"⚠ 硬性约束:本模块当前 provides 的 {names} 与真实库撞名(冒牌替身)。"
+            f"{detail}。{tail}修复时必须改掉这些对外符号名。\n")
 
 
 def _grain_warning(manifest):
@@ -1269,6 +1355,11 @@ def _grain_warning(manifest):
     sw = _shadow_warning(manifest.get("module"))
     if sw:
         notes.append(sw)
+    # 产出侧复查:模型可能无视请求的契约,自行把对外符号命名成 requests/json 之类
+    shim = _shim_symbols(manifest.get("provides"))
+    if shim:
+        notes.append("对外符号 " + "、".join(f"'{s}'({k})" for s, k in shim) +
+                     " 与真实库撞名(冒牌替身),必须改名并改用真库/标准库")
     if manifest.get("truncated"):
         notes.append("输出被截断(已从残缺 JSON 抢救,可能不完整)")
     n = _code_lines(code)
@@ -1452,6 +1543,18 @@ def delegate(task: str, tier: str = "flash", name: str = None,
         contract = {"provides": provides or [], "depends_on": depends_on or []}
     tried = set()  # 本轮回避:同一模型本轮不再重试
     label = name or task[:14]
+    # 防换皮造轮子:provides 的符号与已装库同名(lib_requests 提供 requests)→ 新建直接拒,
+    # 修复模式则并入硬性约束让它改名(修复期硬拒会把已落盘的坏模块永远卡死)
+    _shim = _shim_provides_note(provides, hard=(repair is None and replace_id is None))
+    if _shim:
+        if repair is None and replace_id is None:
+            print(f"   ⛔ 拒绝子任务'{label}': provides 与真实库撞名(冒牌替身)", flush=True)
+            return _shim
+        if repair is not None:
+            repair = dict(repair)
+            repair["original_task"] = _shim + repair.get("original_task", task)
+        else:
+            task = _shim + task
     # 防重复 delegate:请求的 provides 已有模块提供时,把警示并入子任务(35B 记不住侧边存储里已有什么)
     _dup = _dup_provides_note(contract, replace_id, name)
     if _dup:
@@ -1480,8 +1583,9 @@ def delegate(task: str, tier: str = "flash", name: str = None,
             # 局部小修:把诊断方案并入 repair,循环内修复阶段关思考、照方案改
             repair = dict(repair)
             repair["_diag"] = diag
-    # 至少允许 3 次尝试:空代码/限速等失败需要换模型重试的空间(LOCAL_DELEGATE_TRIES 可能只有 1)
+    # 至少允许 3 次尝试:空代码等失败需要换模型重试的空间(LOCAL_DELEGATE_TRIES 可能只有 1)
     _attempt = 0
+    _rl = 0  # 限速重试计数:独立预算,不消耗 _attempt(见 except Nvidia429)
     while _attempt < max(tries, 3):
         _attempt += 1
         model = router.select(tier, exclude=tried)
@@ -1554,10 +1658,23 @@ def delegate(task: str, tier: str = "flash", name: str = None,
                     f"{_code_lines(manifest.get('code'))}行 | 已存入侧边存储(不占上下文){warn}")
         except Nvidia429 as e:
             stop.set(); wp.join(timeout=1)
-            latency = time.perf_counter() - t0
-            # 限速/过载是账号级且暂时的,不计入熔断(避免误冷却),仅退避后重试(不加入 tried,允许同模型)
+            # 限速/过载是账号级且暂时的:不计入熔断(避免误冷却)、不加入 tried(换模型没用,
+            # 配额按账号算)、更不消耗 _attempt——否则 3 次 ×5s 就宣告"所有候选模型均不可用",
+            # 把一次纯粹的"稍后再试"误判成致命失败(实测 SiliconFlow 50609 常持续几十秒)。
             last_err = str(e)
-            time.sleep(BACKOFF)
+            _attempt -= 1
+            _rl += 1
+            if _rl > RL_RETRIES:
+                last_err = f"限速重试 {RL_RETRIES} 次仍未恢复: {last_err}"
+                break
+            # 抖动按比例给:多个子任务同时撞限速时错开重试,避免整齐划一地再撞一次
+            base = min(BACKOFF * (2 ** (_rl - 1)), RL_MAX_WAIT)
+            wait = base * random.uniform(1.0, 1.3)
+            print(f"   ⏳ 限速/过载,{wait:.0f}s 后重试(第 {_rl}/{RL_RETRIES} 次)…", flush=True)
+            try:
+                time.sleep(wait)
+            except KeyboardInterrupt:
+                return f"[delegate 已取消] 子任务'{label}'在限速等待中被用户中断"
             continue
         except KeyboardInterrupt:
             stop.set(); wp.join(timeout=1)
@@ -2395,6 +2512,18 @@ def truncate_chunk(chunk: list, cap: int = TRUNCATE_CAP) -> str:
     return "\n".join(lines)
 
 
+def _hard_squeeze(messages: list, keep: int) -> None:
+    """暴力截断历史:只保留 system + 最近 keep 条。摘要压缩不够用时的最后手段。
+    截断点可能落在 assistant(tool_calls) 与它的 tool 结果之间,留下无主的 tool 消息
+    会让后端困惑甚至报错,故从头剔除孤儿 tool 消息直到对齐。"""
+    if len(messages) <= 1 + keep:
+        return
+    tail = messages[-keep:]
+    while tail and tail[0].get("role") == "tool":
+        tail = tail[1:]
+    messages[:] = [messages[0]] + tail
+
+
 def maybe_compact(messages: list) -> None:
     for _ in range(COMPACT_ROUNDS):
         if history_tokens(messages) <= BUDGET:
@@ -2416,7 +2545,7 @@ def maybe_compact(messages: list) -> None:
         messages[:] = [messages[0]] + [digest_msg] + tail
 
     if history_tokens(messages) > BUDGET and len(messages) > 1 + 4:
-        messages[:] = [messages[0]] + messages[-4:]
+        _hard_squeeze(messages, 4)
 
 
 # ----------------------------------------------------------------------------
@@ -2425,6 +2554,7 @@ def maybe_compact(messages: list) -> None:
 def run_agent(query: str, history: list = None) -> str:
     messages = history if history is not None else [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.append({"role": "user", "content": query})
+    _squeeze_left = 2  # 空答复时的"强压历史再问"配额,防止无限循环
 
     for step in range(1, MAX_ITER + 1):
         maybe_compact(messages)
@@ -2466,6 +2596,20 @@ def run_agent(query: str, history: list = None) -> str:
             continue
 
         final = msg.get("content", "").strip()
+        if not final and _squeeze_left > 0:
+            # 空答复 = 既没调工具也没说话。真因几乎总是"输出预算被历史吃光":
+            # num_ctx 是 prompt+输出共用的,历史一涨 num_predict 就被挤没 →
+            # done_reason=length、content 为空。此时 force_no_think 重试是原地打转
+            # (历史超 THINK_OFF_HISTORY 时思考本来就已关),必须先腾窗口再问。
+            _squeeze_left -= 1
+            before = history_tokens(messages)
+            _hard_squeeze(messages, 6)
+            messages.append({"role": "user", "content":
+                "上一轮没有产出任何内容(上下文过长,输出预算被挤空,历史已压缩)。"
+                "请用不超过 10 行说明当前进度与下一步;若还有未完成的修复/组装,直接调用对应工具。"})
+            print(f"   ⚠ 最终答复为空 → 强制压缩历史({before} → {history_tokens(messages)} tok)"
+                  f"后重试(剩余 {_squeeze_left} 次)", flush=True)
+            continue
         messages.append(msg)
         if history is not None:
             history[:] = messages
@@ -2484,7 +2628,10 @@ def fix_common_errors_prompt(proj: str = "项目") -> str:
         "0. 【先读后改】逐个读取已载入的每个模块的完整代码,先理解再审查;修复必须基于这些真实代码,"
         "不要凭空新建无关的子系统/模块,不要改变对外符号名;\n"
         "1. 孤儿文件:落盘模块名与 main.py 的 import 是否一致(不一致则改 main 的 import 或补模块);\n"
-        "2. 影子模块:不要命名成与标准库/已装第三方库同名(如 requests.py),避免遮蔽真库自引用递归;\n"
+        "2. 影子模块与冒牌替身:① 不要命名成与标准库/已装第三方库同名(如 requests.py),避免遮蔽真库自引用递归;"
+        "② 更不要换个文件名把同一个假库再造一遍(如 lib_requests.py / requests_module.py 对外提供 requests)"
+        "——已装的库直接 import 真库即可,未装的库改用标准库(如 urllib.request)实现,"
+        "且对外符号要取不同名(http_get/http_post),绝不能提供一个叫 requests 的对象;\n"
         "3. 重复模块:同一符号被多个模块重复提供(如 sys_ops.py 与 system_ops.py 都提供 hide_window)时,"
         "合并或删除其一;\n"
         "4. 契约错配:模块对外函数签名与 main.py 调用方式一致(参数顺序/返回值形状,字典是平铺还是嵌套);\n"
